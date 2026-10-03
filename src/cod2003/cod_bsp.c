@@ -295,8 +295,10 @@ int cod_bsp_to_hxmap(const void* data, size_t size, const char* map_name,
                     /* Static world props. Brush models ("*0") stay in the BSP soup. */
                     if ((strcmp(classname, "misc_model") == 0 || strcmp(classname, "script_model") == 0) &&
                         model[0] && model[0] != '*') {
-                        /* Skip destroyed model variants (e.g. bombzone targets) */
-                        if (strstr(model, "_d") != NULL && strstr(model, "_d1") == NULL) {
+                        /* Skip invisible particle emitters and destroyed model variants */
+                        if (strcmp(model, "xmodel/fx") == 0) {
+                            /* Invisible particle fx anchor */
+                        } else if (strstr(model, "_d") != NULL && strstr(model, "_d1") == NULL) {
                             /* Destroyed state - active only after bomb explosion */
                         } else {
                             sb_append(&sb, "entity {\n");
@@ -493,7 +495,6 @@ int cod_bsp_to_hxmap(const void* data, size_t size, const char* map_name,
                            strstr(mat_name, "nosight_noclip") != NULL ||
                            strstr(mat_name, "nodraw_notsolid") != NULL ||
                            strstr(mat_name, "notsolid") != NULL ||
-                           strstr(mat_name, "glass_nosight") != NULL ||
                            strstr(mat_name, "ladder") != NULL ||
                            strstr(mat_name, "corona") != NULL ||
                            strstr(mat_name, "flare") != NULL ||
@@ -524,7 +525,7 @@ int cod_bsp_to_hxmap(const void* data, size_t size, const char* map_name,
                     cont = "solid";
                 }
             } else {
-                int is_walkable = 0;
+                int is_terrain = 0;
                 if (!is_foliage) {
                     if (strstr(mat_name, "ground") != NULL ||
                         strstr(mat_name, "terrain") != NULL ||
@@ -533,37 +534,13 @@ int cod_bsp_to_hxmap(const void* data, size_t size, const char* map_name,
                         strstr(mat_name, "snow") != NULL ||
                         strstr(mat_name, "mud") != NULL ||
                         strstr(mat_name, "sand") != NULL ||
-                        strstr(mat_name, "rock") != NULL ||
                         strstr(mat_name, "gravel") != NULL ||
                         strstr(mat_name, "path") != NULL ||
-                        strstr(mat_name, "road") != NULL ||
-                        strstr(mat_name, "floor") != NULL) {
-                        is_walkable = 1;
-                    } else {
-                        /* Check if any triangle in this soup has upward-facing normal */
-                        for (t = 0; t + 2 < soup->triangle_count; t += 3) {
-                            unsigned short idx0 = indices[soup->triangle_offset + t];
-                            unsigned short idx1 = indices[soup->triangle_offset + t + 1];
-                            unsigned short idx2 = indices[soup->triangle_offset + t + 2];
-                            if (idx0 < soup->vertex_count && idx1 < soup->vertex_count && idx2 < soup->vertex_count) {
-                                const float* p0 = verts[soup->vertex_offset + idx0].pos;
-                                const float* p1 = verts[soup->vertex_offset + idx1].pos;
-                                const float* p2 = verts[soup->vertex_offset + idx2].pos;
-                                float e1x = p1[0] - p0[0], e1y = p1[1] - p0[1], e1z = p1[2] - p0[2];
-                                float e2x = p2[0] - p0[0], e2y = p2[1] - p0[1], e2z = p2[2] - p0[2];
-                                float c_nz = e1x * e2y - e1y * e2x;
-                                float c_nx = e1y * e2z - e1z * e2y;
-                                float c_ny = e1z * e2x - e1x * e2z;
-                                float len_sq = c_nx * c_nx + c_ny * c_ny + c_nz * c_nz;
-                                if (len_sq > 1e-8f && (c_nz * c_nz) >= 0.3025f * len_sq) {
-                                    is_walkable = 1;
-                                    break;
-                                }
-                            }
-                        }
+                        strstr(mat_name, "road") != NULL) {
+                        is_terrain = 1;
                     }
                 }
-                if (is_walkable) {
+                if (is_terrain) {
                     cont = "solid";
                 }
             }
