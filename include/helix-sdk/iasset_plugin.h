@@ -21,7 +21,7 @@
 extern "C" {
 #endif
 
-#define HELIX_ASSET_PLUGIN_API_VERSION 1
+#define HELIX_ASSET_PLUGIN_API_VERSION 2
 
 /**
  * hxAssetPlugin
@@ -42,7 +42,7 @@ typedef struct hxAssetPlugin {
     /**
      * open() -- Open an archive file at the given filesystem path.
      * Returns 1 on success, 0 on failure.
-     * May be called multiple times; each call replaces the previous archive.
+     * May be called multiple times; each call replaces the previous archive(s).
      */
     int (*open)(struct hxAssetPlugin* self, const char* path);
 
@@ -87,8 +87,8 @@ typedef struct hxAssetPlugin {
                       unsigned int         count);
 
     /**
-     * close() -- Close the currently open archive and release archive-level
-     * resources.  The plugin struct itself remains alive.
+     * close() -- Close the currently open archive(s) and release resources.
+     * The plugin struct itself remains alive.
      */
     void (*close)(struct hxAssetPlugin* self);
 
@@ -98,6 +98,21 @@ typedef struct hxAssetPlugin {
      * After this call the pointer is invalid.
      */
     void (*destroy)(struct hxAssetPlugin* self);
+
+    /**
+     * open_many() -- Open multiple archives at once (last-wins order).
+     * Replaces any previously opened archives.
+     * Returns the number of successfully opened archives.
+     */
+    int (*open_many)(struct hxAssetPlugin* self, const char** paths, int count);
+
+    /**
+     * open_dir() -- Scan a directory and open all archives matching the plugin's
+     * format (e.g. *.pak). Sorted alphabetically (last-wins).
+     * Replaces any previously opened archives.
+     * Returns the number of successfully opened archives.
+     */
+    int (*open_dir)(struct hxAssetPlugin* self, const char* dir_path);
 
 } hxAssetPlugin;
 

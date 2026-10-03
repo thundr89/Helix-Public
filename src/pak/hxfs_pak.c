@@ -11,6 +11,7 @@
 #include "iasset_plugin.h"
 #include "pak_file.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -20,36 +21,172 @@
 #define HXFS_EXPORT __attribute__((visibility("default")))
 #endif
 
+
+#if defined(_MSC_VER)
+#define hxfs_strcasecmp _stricmp
+#define hxfs_strdup _strdup
+#else
+#include <strings.h>
+#define hxfs_strcasecmp strcasecmp
+#define hxfs_strdup strdup
+#endif
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dirent.h>
+#endif
+
 typedef struct {
     hxAssetPlugin api;
-    PakFile* pak;
+    PakFile** files;
+    int count;
+    int cap;
 } HxfsPak;
+
+static void hxfs_close_all(HxfsPak* p) {
+    int i;
+    if (!p) return;
+    for (i = 0; i < p->count; i++) {
+        if (p->files[i]) {
+            pak_close(p->files[i]);
+        }
+    }
+    free(p->files);
+    p->files = NULL;
+    p->count = 0;
+    p->cap = 0;
+}
+
+static int hxfs_add_file(HxfsPak* p, const char* path) {
+    PakFile* next = pak_open_file(path);
+    if (!next) return 0;
+    if (p->count == p->cap) {
+        int ncap = p->cap ? p->cap * 2 : 4;
+        PakFile** n = (PakFile**)realloc(p->files, ncap * sizeof(PakFile*));
+        if (!n) {
+            pak_close(next);
+            return 0;
+        }
+        p->files = n;
+        p->cap = ncap;
+    }
+    p->files[p->count++] = next;
+    return 1;
+}
 
 static int hxfs_open(hxAssetPlugin* self, const char* path) {
     HxfsPak* p = (HxfsPak*)self;
-    PakFile* next;
     if (!p) return 0;
-    if (p->pak) {
-        pak_close(p->pak);
-        p->pak = NULL;
-    }
+    hxfs_close_all(p);
     if (!path || !path[0]) return 0;
-    next = pak_open_file(path);
-    if (!next) return 0;
-    p->pak = next;
-    return 1;
+    return hxfs_add_file(p, path);
+}
+
+static int hxfs_open_many(hxAssetPlugin* self, const char** paths, int count) {
+    HxfsPak* p = (HxfsPak*)self;
+    int i, opened = 0;
+    if (!p) return 0;
+    hxfs_close_all(p);
+    if (!paths) return 0;
+    for (i = 0; i < count; i++) {
+        if (paths[i] && paths[i][0]) {
+            if (hxfs_add_file(p, paths[i])) opened++;
+        }
+    }
+    return opened;
+}
+
+static int cmp_str(const void* a, const void* b) {
+    return strcmp(*(const char**)a, *(const char**)b);
+}
+
+static int hxfs_open_dir(hxAssetPlugin* self, const char* dir_path) {
+    HxfsPak* p = (HxfsPak*)self;
+    int opened = 0;
+    char** paths = NULL;
+    int pcount = 0, pcap = 0;
+    int i;
+    
+    if (!p) return 0;
+    hxfs_close_all(p);
+    if (!dir_path || !dir_path[0]) return 0;
+
+#ifdef _WIN32
+    {
+        WIN32_FIND_DATAA fd;
+        HANDLE hFind;
+        char search[512];
+        snprintf(search, sizeof(search), "%s/*.pak", dir_path);
+        hFind = FindFirstFileA(search, &fd);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            do {
+                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                    if (pcount == pcap) {
+                        pcap = pcap ? pcap * 2 : 16;
+                        paths = (char**)realloc(paths, pcap * sizeof(char*));
+                    }
+                    paths[pcount] = (char*)malloc(strlen(dir_path) + strlen(fd.cFileName) + 2);
+                    sprintf(paths[pcount], "%s/%s", dir_path, fd.cFileName);
+                    pcount++;
+                }
+            } while (FindNextFileA(hFind, &fd));
+            FindClose(hFind);
+        }
+    }
+#else
+    {
+        DIR* dir = opendir(dir_path);
+        if (dir) {
+            struct dirent* ent;
+            while ((ent = readdir(dir)) != NULL) {
+                size_t len = strlen(ent->d_name);
+                size_t extlen = strlen(".pak");
+                if (len >= extlen && hxfs_strcasecmp(ent->d_name + len - extlen, ".pak") == 0) {
+                    if (pcount == pcap) {
+                        pcap = pcap ? pcap * 2 : 16;
+                        paths = (char**)realloc(paths, pcap * sizeof(char*));
+                    }
+                    paths[pcount] = (char*)malloc(strlen(dir_path) + strlen(ent->d_name) + 2);
+                    sprintf(paths[pcount], "%s/%s", dir_path, ent->d_name);
+                    pcount++;
+                }
+            }
+            closedir(dir);
+        }
+    }
+#endif
+
+    if (pcount > 0) {
+        qsort(paths, pcount, sizeof(char*), cmp_str);
+        for (i = 0; i < pcount; i++) {
+            if (hxfs_add_file(p, paths[i])) opened++;
+            free(paths[i]);
+        }
+        free(paths);
+    }
+    
+    return opened;
 }
 
 static int hxfs_contains(hxAssetPlugin* self, const char* name) {
     HxfsPak* p = (HxfsPak*)self;
-    if (!p || !p->pak) return 0;
-    return pak_contains(p->pak, name);
+    int i;
+    if (!p) return 0;
+    for (i = p->count - 1; i >= 0; i--) {
+        if (pak_contains(p->files[i], name)) return 1;
+    }
+    return 0;
 }
 
 static int hxfs_read(hxAssetPlugin* self, const char* name, unsigned char** out_buf, unsigned int* out_size) {
     HxfsPak* p = (HxfsPak*)self;
-    if (!p || !p->pak) return 0;
-    return pak_read(p->pak, name, out_buf, out_size);
+    int i;
+    if (!p) return 0;
+    for (i = p->count - 1; i >= 0; i--) {
+        if (pak_read(p->files[i], name, out_buf, out_size)) return 1;
+    }
+    return 0;
 }
 
 static void hxfs_free_buf(hxAssetPlugin* self, unsigned char* buf) {
@@ -59,33 +196,61 @@ static void hxfs_free_buf(hxAssetPlugin* self, unsigned char* buf) {
 
 static void hxfs_list(hxAssetPlugin* self, char*** names, unsigned int* count) {
     HxfsPak* p = (HxfsPak*)self;
+    int i;
+    unsigned int j;
+    char** all_names = NULL;
+    unsigned int all_count = 0;
+    unsigned int all_cap = 0;
+
     if (!names || !count) return;
-    if (!p || !p->pak) {
-        *names = NULL;
-        *count = 0;
-        return;
+    *names = NULL;
+    *count = 0;
+    if (!p) return;
+
+    for (i = p->count - 1; i >= 0; i--) {
+        char** tnames = NULL;
+        unsigned int tcount = 0;
+        pak_list(p->files[i], &tnames, &tcount);
+        for (j = 0; j < tcount; j++) {
+            unsigned int k;
+            int found = 0;
+            for (k = 0; k < all_count; k++) {
+                if (hxfs_strcasecmp(all_names[k], tnames[j]) == 0) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                if (all_count == all_cap) {
+                    all_cap = all_cap ? all_cap * 2 : 64;
+                    all_names = (char**)realloc(all_names, all_cap * sizeof(char*));
+                }
+                all_names[all_count++] = hxfs_strdup(tnames[j]);
+            }
+        }
+        pak_free_list(tnames, tcount);
     }
-    pak_list(p->pak, names, count);
+    
+    *names = all_names;
+    *count = all_count;
 }
 
 static void hxfs_free_list(hxAssetPlugin* self, char** names, unsigned int count) {
+    unsigned int i;
     (void)self;
-    pak_free_list(names, count);
+    if (!names) return;
+    for (i = 0; i < count; i++) free(names[i]);
+    free(names);
 }
 
 static void hxfs_close(hxAssetPlugin* self) {
-    HxfsPak* p = (HxfsPak*)self;
-    if (!p) return;
-    if (p->pak) {
-        pak_close(p->pak);
-        p->pak = NULL;
-    }
+    hxfs_close_all((HxfsPak*)self);
 }
 
 static void hxfs_destroy(hxAssetPlugin* self) {
     HxfsPak* p = (HxfsPak*)self;
     if (!p) return;
-    hxfs_close(self);
+    hxfs_close_all(p);
     free(p);
 }
 
@@ -101,6 +266,8 @@ HXFS_EXPORT hxAssetPlugin* helix_asset_plugin_create(void) {
     p->api.list = hxfs_list;
     p->api.free_list = hxfs_free_list;
     p->api.close = hxfs_close;
+    p->api.open_many = hxfs_open_many;
+    p->api.open_dir = hxfs_open_dir;
     p->api.destroy = hxfs_destroy;
     return &p->api;
 }

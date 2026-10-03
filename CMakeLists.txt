@@ -62,6 +62,9 @@ if(NOT ZLIB_ROOT)
     endif()
 endif()
 find_package(ZLIB REQUIRED)
+if(WIN32)
+    find_library(ZLIB_STATIC_LIB NAMES libz.a zlibstatic PATHS "${_hx_sysroot}/lib")
+endif()
 
 set(HXFS_ZIP_CORE src/zip/zip_file.c)
 
@@ -174,6 +177,42 @@ target_include_directories(hxfs_ff_test PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src/ff")
 target_link_libraries(hxfs_ff_test PRIVATE ZLIB::ZLIB)
 
+set(HXFS_COD2003_SOURCES
+    ${HXFS_ZIP_CORE}
+    src/cod2003/cod_bsp.c
+    src/cod2003/cod_xmodel.c
+    src/cod2003/hxfs_cod2003.c)
+
+add_library(cod2003 SHARED ${HXFS_COD2003_SOURCES})
+target_include_directories(cod2003 PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/helix-sdk"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/zip"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/cod2003")
+if(WIN32 AND ZLIB_STATIC_LIB)
+    target_link_libraries(cod2003 PRIVATE "${ZLIB_STATIC_LIB}")
+    target_link_options(cod2003 PRIVATE "-static-libgcc")
+else()
+    target_link_libraries(cod2003 PRIVATE ZLIB::ZLIB)
+endif()
+set_target_properties(cod2003 PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "cod2003"
+    C_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON)
+
+if(WIN32)
+    target_compile_definitions(cod2003 PRIVATE HXFS_COD2003_EXPORTS)
+endif()
+
+add_executable(cod2003_test
+    tests/cod2003_test.c
+    ${HXFS_COD2003_SOURCES})
+target_include_directories(cod2003_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/helix-sdk"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/zip"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/cod2003")
+target_link_libraries(cod2003_test PRIVATE ZLIB::ZLIB)
+
 enable_testing()
 add_test(NAME hxfs_wad_test COMMAND hxfs_wad_test)
 add_test(NAME hxfs_pak_test COMMAND hxfs_pak_test)
@@ -181,3 +220,4 @@ add_test(NAME hxfs_pk3_test COMMAND hxfs_pk3_test)
 add_test(NAME hxfs_pk4_test COMMAND hxfs_pk4_test)
 add_test(NAME hxfs_iwd_test COMMAND hxfs_iwd_test)
 add_test(NAME hxfs_ff_test COMMAND hxfs_ff_test)
+add_test(NAME cod2003_test COMMAND cod2003_test)
