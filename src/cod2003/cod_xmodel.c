@@ -182,14 +182,48 @@ int cod_xmodel_lod_name(const void* data, size_t size, char* out, size_t out_cap
     return out[0] != '\0';
 }
 
-/* Retail CoD1 surfs. Rigid verts are already in model space. */
-static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off, Xsb* sb) {
+typedef struct {
+    float trans[3];
+} CoD1Bone;
+
+/* Retail CoD1 surfs. Rigid verts with bone > 0 are translated by xmodelparts bind pose. */
+static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
+                          const unsigned char* parts, size_t parts_size, Xsb* sb) {
     unsigned short num_meshes = 0;
     unsigned short m;
     int vert_base = 1;
+    CoD1Bone* bones = NULL;
+    unsigned short p_ver = 0, p_num_bones = 0, p_unk = 0;
+    size_t p_off = 0;
 
-    if (!ru16(p, size, &off, &num_meshes)) return 0;
-    if (num_meshes == 0 || num_meshes > 64) return 0;
+    if (parts && parts_size >= 6 &&
+        ru16(parts, parts_size, &p_off, &p_ver) &&
+        ru16(parts, parts_size, &p_off, &p_num_bones) &&
+        ru16(parts, parts_size, &p_off, &p_unk)) {
+        if (p_ver == 14 && p_num_bones > 0 && p_num_bones <= 256) {
+            bones = (CoD1Bone*)calloc(p_num_bones, sizeof(CoD1Bone));
+            if (bones) {
+                unsigned short bi;
+                for (bi = 0; bi < p_num_bones; bi++) {
+                    size_t b_off = 6 + (size_t)bi * 19 + 1;
+                    if (b_off + 12 <= parts_size) {
+                        rf32(parts, parts_size, &b_off, &bones[bi].trans[0]);
+                        rf32(parts, parts_size, &b_off, &bones[bi].trans[1]);
+                        rf32(parts, parts_size, &b_off, &bones[bi].trans[2]);
+                    }
+                }
+            }
+        }
+    }
+
+    if (!ru16(p, size, &off, &num_meshes)) {
+        free(bones);
+        return 0;
+    }
+    if (num_meshes == 0 || num_meshes > 64) {
+        free(bones);
+        return 0;
+    }
 
     for (m = 0; m < num_meshes; m++) {
         unsigned short num_verts = 0, num_tris = 0, pad = 0, bone = 0;
@@ -201,17 +235,22 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off, Xsb* 
         int guard = 0;
         unsigned short v;
         int ok = 1;
+        float tx = 0.f, ty = 0.f, tz = 0.f;
 
-        if (!need(off, 1, size)) return 0;
+        if (!need(off, 1, size)) { free(bones); return 0; }
         off++; /* unknown */
-        if (!ru16(p, size, &off, &num_verts) || !ru16(p, size, &off, &num_tris)) return 0;
-        if (!ru16(p, size, &off, &pad) || !ru16(p, size, &off, &bone)) return 0;
+        if (!ru16(p, size, &off, &num_verts) || !ru16(p, size, &off, &num_tris)) { free(bones); return 0; }
+        if (!ru16(p, size, &off, &pad) || !ru16(p, size, &off, &bone)) { free(bones); return 0; }
         (void)pad;
-        if (num_verts == 0 || num_tris == 0 || num_verts > 65535) return 0;
+        if (num_verts == 0 || num_tris == 0 || num_verts > 65535) { free(bones); return 0; }
         rigged = (bone == 65535);
         if (rigged) {
-            if (!need(off, 4, size)) return 0;
+            if (!need(off, 4, size)) { free(bones); return 0; }
             off += 4;
+        } else if (bones && bone > 0 && bone <= p_num_bones) {
+            tx = bones[bone - 1].trans[0];
+            ty = bones[bone - 1].trans[1];
+            tz = bones[bone - 1].trans[2];
         }
 
         tris = (unsigned short*)malloc((size_t)num_tris * 3 * sizeof(unsigned short));
@@ -325,7 +364,7 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off, Xsb* 
                 if (!need(off, 4, size)) ok = 0;
                 else off += 4;
             }
-            if (ok && !xsb_append_f(sb, "v %.6g %.6g %.6g\n", pos[0], pos[1], pos[2])) ok = 0;
+            if (ok && !xsb_append_f(sb, "v %.6g %.6g %.6g\n", pos[0] + tx, pos[1] + ty, pos[2] + tz)) ok = 0;
             if (ok && !xsb_append_f(sb, "vt %.6g %.6g\n", uv[0], uv[1])) ok = 0;
             if (ok && !xsb_append_f(sb, "vn %.6g %.6g %.6g\n", n[0], n[1], n[2])) ok = 0;
         }
@@ -341,6 +380,7 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off, Xsb* 
         if (!ok) {
             free(tris);
             free(wcs);
+            free(bones);
             return 0;
         }
         {
@@ -352,6 +392,7 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off, Xsb* 
                 if (!xsb_append_f(sb, "f %d/%d/%d %d/%d/%d %d/%d/%d\n", a, a, a, b, b, b, c, c, c)) {
                     free(tris);
                     free(wcs);
+                    free(bones);
                     return 0;
                 }
             }
@@ -360,17 +401,19 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off, Xsb* 
         free(tris);
         free(wcs);
     }
+    free(bones);
     return 1;
 }
 
-static int emit_surfs(const unsigned char* p, size_t size, Xsb* sb) {
+static int emit_surfs(const unsigned char* p, size_t size,
+                      const unsigned char* parts, size_t parts_size, Xsb* sb) {
     size_t off = 0;
     unsigned short ver = 0, num_meshes = 0;
     unsigned short m;
     int vert_base = 1; /* OBJ is 1-based across meshes */
 
     if (!ru16(p, size, &off, &ver)) return 0;
-    if (ver == 14) return emit_surfs_v14(p, size, off, sb);
+    if (ver == 14) return emit_surfs_v14(p, size, off, parts, parts_size, sb);
     if (ver != 5 && ver != 20 && ver != 25) return 0;
     if (!ru16(p, size, &off, &num_meshes)) return 0;
     if (num_meshes == 0 || num_meshes > 256) return 0;
@@ -597,6 +640,7 @@ static int emit_text(const char* text, size_t size, Xsb* sb) {
 
 int cod_xmodel_to_obj(const void* xmodel, size_t xmodel_size,
                       const void* surfs, size_t surfs_size,
+                      const void* parts, size_t parts_size,
                       unsigned char** out_buf, unsigned int* out_size) {
     Xsb sb;
     int ok = 0;
@@ -609,7 +653,8 @@ int cod_xmodel_to_obj(const void* xmodel, size_t xmodel_size,
         ok = emit_text((const char*)xmodel, xmodel_size, &sb);
     } else if (surfs && surfs_size >= 4) {
         if (!xsb_append(&sb, "# helix xmodel\n")) ok = 0;
-        else ok = emit_surfs((const unsigned char*)surfs, surfs_size, &sb);
+        else ok = emit_surfs((const unsigned char*)surfs, surfs_size,
+                             (const unsigned char*)parts, parts_size, &sb);
         if (xmodel && xmodel_size >= 2 && !cod_xmodel_is_text(xmodel, xmodel_size)) {
             unsigned short ver = 0;
             size_t off = 0;

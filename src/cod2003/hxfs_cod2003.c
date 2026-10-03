@@ -392,14 +392,16 @@ static int hxfs_read_zip(HxfsCod2003* p, const char* name, unsigned char** out_b
 static int hxfs_read_xmodel(HxfsCod2003* p, const char* name, unsigned char** out_buf, unsigned int* out_size) {
     unsigned char* xm = NULL;
     unsigned char* sf = NULL;
-    unsigned int xsz = 0, ssz = 0;
+    unsigned char* pt = NULL;
+    unsigned int xsz = 0, ssz = 0, psz = 0;
     char lod[128];
     char surf[300];
+    char parts[300];
     int ok;
 
     if (!hxfs_read_zip(p, name, &xm, &xsz)) return 0;
     if (cod_xmodel_is_text(xm, xsz)) {
-        ok = cod_xmodel_to_obj(xm, xsz, NULL, 0, out_buf, out_size);
+        ok = cod_xmodel_to_obj(xm, xsz, NULL, 0, NULL, 0, out_buf, out_size);
         free(xm);
         return ok;
     }
@@ -413,7 +415,11 @@ static int hxfs_read_xmodel(HxfsCod2003* p, const char* name, unsigned char** ou
         free(xm);
         return 0;
     }
-    ok = cod_xmodel_to_obj(xm, xsz, sf, ssz, out_buf, out_size);
+    snprintf(parts, sizeof(parts), "xmodelparts/%s", lod);
+    hxfs_read_zip(p, parts, &pt, &psz); /* optional bind-pose bones */
+
+    ok = cod_xmodel_to_obj(xm, xsz, sf, ssz, pt, psz, out_buf, out_size);
+    if (pt) free(pt);
     free(sf);
     free(xm);
     return ok;

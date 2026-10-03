@@ -32,15 +32,16 @@ int cod_xmodel_lod_name(const void* data, size_t size, char* out, size_t out_cap
 
 /*
  * Convert an xmodel into OBJ text.
- * Text export: `surfs` may be NULL.
- * Binary: `xmodel` is the xmodel header (used only to accept the version) and
- * `surfs` is the matching xmodelsurfs blob. Bind-pose positions are emitted;
- * skin weights are skipped.
+ * Text export: `surfs` and `parts` may be NULL.
+ * Binary: `xmodel` is the xmodel header (version checked), `surfs` is the
+ * matching xmodelsurfs blob, and `parts` is the optional xmodelparts blob
+ * providing bind-pose bone translations for multi-part models (e.g. vehicle wheels).
  * On success *out_buf is malloc'd OBJ text and the function returns 1.
  * Caller frees *out_buf with free().
  */
 int cod_xmodel_to_obj(const void* xmodel, size_t xmodel_size,
                       const void* surfs, size_t surfs_size,
+                      const void* parts, size_t parts_size,
                       unsigned char** out_buf, unsigned int* out_size);
 
 #ifdef __cplusplus

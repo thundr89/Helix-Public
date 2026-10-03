@@ -117,7 +117,7 @@ static void test_xmodel_text(void) {
     unsigned char* obj = NULL;
     unsigned int sz = 0;
     assert(cod_xmodel_is_text(text, strlen(text)) == 1);
-    assert(cod_xmodel_to_obj(text, strlen(text), NULL, 0, &obj, &sz) == 1);
+    assert(cod_xmodel_to_obj(text, strlen(text), NULL, 0, NULL, 0, &obj, &sz) == 1);
     assert(obj != NULL);
     assert(strstr((const char*)obj, "v 1 2 3\n") != NULL);
     assert(strstr((const char*)obj, "f 1 2 3\n") != NULL);
@@ -172,7 +172,7 @@ static void test_xmodel_binary(void) {
     put_u16(surfs + soff, 2); soff += 2;
     assert(soff < sizeof(surfs));
 
-    assert(cod_xmodel_to_obj(header, hoff, surfs, soff, &obj, &sz) == 1);
+    assert(cod_xmodel_to_obj(header, hoff, surfs, soff, NULL, 0, &obj, &sz) == 1);
     assert(strstr((const char*)obj, "v 0 0 0\n") != NULL);
     assert(strstr((const char*)obj, "v 1 0 0\n") != NULL);
     assert(strstr((const char*)obj, "v 2 0 0\n") != NULL);
@@ -223,13 +223,76 @@ static void test_xmodel_v14(void) {
         put_f32(surfs + soff, 0); soff += 4;
     }
     assert(soff < sizeof(surfs));
-    assert(cod_xmodel_to_obj(header, hoff, surfs, soff, &obj, &sz) == 1);
+    assert(cod_xmodel_to_obj(header, hoff, surfs, soff, NULL, 0, &obj, &sz) == 1);
     assert(strstr((const char*)obj, "v 0 0 0\n") != NULL);
     assert(strstr((const char*)obj, "v 1 0 0\n") != NULL);
     assert(strstr((const char*)obj, "v 2 0 0\n") != NULL);
     assert(strstr((const char*)obj, "f 1/1/1 3/3/3 2/2/2\n") != NULL);
     free(obj);
     printf("test_xmodel_v14: PASS\n");
+}
+
+static void test_xmodel_v14_bones(void) {
+    unsigned char header[64];
+    unsigned char surfs[256];
+    unsigned char parts[64];
+    size_t hoff = 0, soff = 0, poff = 0;
+    unsigned char* obj = NULL;
+    unsigned int sz = 0;
+    int i;
+
+    memset(header, 0, sizeof(header));
+    memset(surfs, 0, sizeof(surfs));
+    memset(parts, 0, sizeof(parts));
+
+    put_u16(header + hoff, 14); hoff += 2;
+    hoff += 24; /* mins/maxs */
+    put_f32(header + hoff, 0.f); hoff += 4;
+    memcpy(header + hoff, "truck_wheel0", 13); hoff += 13;
+
+    /* xmodelparts: ver=14, num_bones=1, unk=1 */
+    put_u16(parts + poff, 14); poff += 2;
+    put_u16(parts + poff, 1); poff += 2;
+    put_u16(parts + poff, 1); poff += 2;
+    /* Bone 0: 19 bytes. byte 0 = parent(0), bytes 1..12 = tx, ty, tz */
+    parts[poff++] = 0;
+    put_f32(parts + poff, 10.0f); poff += 4;
+    put_f32(parts + poff, 20.0f); poff += 4;
+    put_f32(parts + poff, 30.0f); poff += 4;
+    poff += 6; /* orientation */
+
+    /* xmodelsurfs: 1 mesh with bone=1 (1-based, maps to bone 0) */
+    put_u16(surfs + soff, 14); soff += 2;
+    put_u16(surfs + soff, 1); soff += 2;
+    surfs[soff++] = 0;
+    put_u16(surfs + soff, 3); soff += 2;
+    put_u16(surfs + soff, 1); soff += 2;
+    put_u16(surfs + soff, 0); soff += 2;
+    put_u16(surfs + soff, 1); soff += 2; /* bone = 1 -> Bone 0 translated by (10, 20, 30) */
+    surfs[soff++] = 3;                   /* strip length */
+    put_u16(surfs + soff, 0); soff += 2;
+    put_u16(surfs + soff, 1); soff += 2;
+    put_u16(surfs + soff, 2); soff += 2;
+    for (i = 0; i < 3; i++) {
+        put_f32(surfs + soff, 0); soff += 4;
+        put_f32(surfs + soff, 0); soff += 4;
+        put_f32(surfs + soff, 1); soff += 4;
+        put_f32(surfs + soff, 0.5f); soff += 4;
+        put_f32(surfs + soff, 0.25f); soff += 4;
+        put_f32(surfs + soff, (float)i); soff += 4;
+        put_f32(surfs + soff, 0); soff += 4;
+        put_f32(surfs + soff, 0); soff += 4;
+    }
+
+    assert(cod_xmodel_to_obj(header, hoff, surfs, soff, parts, poff, &obj, &sz) == 1);
+    /* Vertex 0 (0, 0, 0) translated by (10, 20, 30) -> (10, 20, 30) */
+    assert(strstr((const char*)obj, "v 10 20 30\n") != NULL);
+    /* Vertex 1 (1, 0, 0) translated by (10, 20, 30) -> (11, 20, 30) */
+    assert(strstr((const char*)obj, "v 11 20 30\n") != NULL);
+    /* Vertex 2 (2, 0, 0) translated by (10, 20, 30) -> (12, 20, 30) */
+    assert(strstr((const char*)obj, "v 12 20 30\n") != NULL);
+    free(obj);
+    printf("test_xmodel_v14_bones: PASS\n");
 }
 
 int main(void) {
@@ -239,6 +302,7 @@ int main(void) {
     test_xmodel_text();
     test_xmodel_binary();
     test_xmodel_v14();
+    test_xmodel_v14_bones();
     printf("All cod2003 tests passed!\n");
     return 0;
 }

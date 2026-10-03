@@ -21,8 +21,8 @@
 #define LUMP_MATERIALS      0
 #define LUMP_LIGHTMAPS      1
 #define LUMP_PLANES         2
-#define LUMP_NODES          3
-#define LUMP_LEAFS          4
+#define LUMP_BRUSHSIDES     3
+#define LUMP_BRUSHES        4
 #define LUMP_LEAFSURFACES   5
 #define LUMP_TRIANGLESOUPS  6
 #define LUMP_VERTICES       7
@@ -31,10 +31,30 @@
 #define LUMP_ENTITIES      29
 
 typedef struct {
+    float normal[3];
+    float dist;
+} CoD1Plane;
+
+typedef struct {
+    union {
+        float        dist;
+        unsigned int plane;
+    } column1;
+    unsigned int material_id;
+} CoD1BrushSide;
+
+typedef struct {
+    unsigned short sides;
+    unsigned short material_id;
+} CoD1Brush;
+
+typedef struct {
     float mins[3];
     float maxs[3];
     int first_surf;
     int num_surfs;
+    int unk1;
+    int unk2;
     int first_brush;
     int num_brushes;
 } CoD1Model;
@@ -273,15 +293,21 @@ int cod_bsp_to_hxmap(const void* data, size_t size, const char* map_name,
                     }
 
                     /* Static world props. Brush models ("*0") stay in the BSP soup. */
-                    if (strcmp(classname, "misc_model") == 0 && model[0] && model[0] != '*') {
-                        sb_append(&sb, "entity {\n");
-                        sb_append(&sb, "  \"classname\" \"misc_model\"\n");
-                        sb_append_f(&sb, "  \"model\" \"%s\"\n", model);
-                        if (origin[0]) sb_append_f(&sb, "  \"origin\" \"%s\"\n", origin);
-                        if (angles[0]) sb_append_f(&sb, "  \"angles\" \"%s\"\n", angles);
-                        else if (angle[0]) sb_append_f(&sb, "  \"angle\" \"%s\"\n", angle);
-                        if (modelscale[0]) sb_append_f(&sb, "  \"modelscale\" \"%s\"\n", modelscale);
-                        sb_append(&sb, "}\n\n");
+                    if ((strcmp(classname, "misc_model") == 0 || strcmp(classname, "script_model") == 0) &&
+                        model[0] && model[0] != '*') {
+                        /* Skip destroyed model variants (e.g. bombzone targets) */
+                        if (strstr(model, "_d") != NULL && strstr(model, "_d1") == NULL) {
+                            /* Destroyed state - active only after bomb explosion */
+                        } else {
+                            sb_append(&sb, "entity {\n");
+                            sb_append(&sb, "  \"classname\" \"misc_model\"\n");
+                            sb_append_f(&sb, "  \"model\" \"%s\"\n", model);
+                            if (origin[0]) sb_append_f(&sb, "  \"origin\" \"%s\"\n", origin);
+                            if (angles[0]) sb_append_f(&sb, "  \"angles\" \"%s\"\n", angles);
+                            else if (angle[0]) sb_append_f(&sb, "  \"angle\" \"%s\"\n", angle);
+                            if (modelscale[0]) sb_append_f(&sb, "  \"modelscale\" \"%s\"\n", modelscale);
+                            sb_append(&sb, "}\n\n");
+                        }
                     }
                 }
             } else {
@@ -300,14 +326,122 @@ int cod_bsp_to_hxmap(const void* data, size_t size, const char* map_name,
         max_world[0] =  256.f; max_world[1] =  256.f; max_world[2] = 128.f;
     }
 
-    /* 2. Parse Materials (Lump 0), TriangleSoups (Lump 6), Vertices (Lump 7), MeshVerts (Lump 8) */
-    if (lumps[LUMP_MATERIALS].length > 0 &&
-        lumps[LUMP_TRIANGLESOUPS].length > 0 &&
+    /* 2. Parse Brushes (Lump 4), BrushSides (Lump 3), Planes (Lump 2), Materials (Lump 0) */
+    int brushes_emitted = 0;
+    unsigned int num_materials = 0;
+    const CoDMaterial* materials = NULL;
+    if (lumps[LUMP_MATERIALS].length > 0) {
+        num_materials = lumps[LUMP_MATERIALS].length / sizeof(CoDMaterial);
+        materials = (const CoDMaterial*)(bytes + lumps[LUMP_MATERIALS].offset);
+    }
+
+    if (lumps[LUMP_BRUSHES].length > 0 &&
+        lumps[LUMP_BRUSHSIDES].length > 0) {
+
+        unsigned int num_brushes = lumps[LUMP_BRUSHES].length / sizeof(CoD1Brush);
+        if (lumps[LUMP_MODELS].length >= sizeof(CoD1Model)) {
+            const CoD1Model* world_model = (const CoD1Model*)(bytes + lumps[LUMP_MODELS].offset);
+            if (world_model->num_brushes > 0 && (unsigned int)world_model->num_brushes <= num_brushes) {
+                num_brushes = (unsigned int)world_model->num_brushes;
+            }
+        }
+        const CoD1Brush* brushes = (const CoD1Brush*)(bytes + lumps[LUMP_BRUSHES].offset);
+
+        unsigned int num_brushsides = lumps[LUMP_BRUSHSIDES].length / sizeof(CoD1BrushSide);
+        const CoD1BrushSide* brushsides = (const CoD1BrushSide*)(bytes + lumps[LUMP_BRUSHSIDES].offset);
+
+        unsigned int num_planes = (lumps[LUMP_PLANES].length > 0) ? (lumps[LUMP_PLANES].length / sizeof(CoD1Plane)) : 0;
+        const CoD1Plane* planes = (num_planes > 0) ? (const CoD1Plane*)(bytes + lumps[LUMP_PLANES].offset) : NULL;
+
+        unsigned int side_idx = 0;
+        unsigned int b;
+
+        for (b = 0; b < num_brushes; b++) {
+            const CoD1Brush* brush = &brushes[b];
+            unsigned int num_sides = brush->sides;
+
+            if (side_idx + num_sides > num_brushsides) break;
+
+            if (num_sides >= 6) {
+                const char* mat_name = "textures/dev/wall";
+                unsigned int cflags = 0;
+                if (materials && brush->material_id < num_materials) {
+                    if (materials[brush->material_id].name[0]) {
+                        mat_name = materials[brush->material_id].name;
+                    }
+                    cflags = materials[brush->material_id].content_flags;
+                }
+
+                int is_tool = (strstr(mat_name, "trigger") != NULL ||
+                               strstr(mat_name, "portal") != NULL ||
+                               strstr(mat_name, "sky") != NULL ||
+                               strstr(mat_name, "origin") != NULL ||
+                               strstr(mat_name, "hint") != NULL ||
+                               strstr(mat_name, "skip") != NULL ||
+                               strstr(mat_name, "lightgrid") != NULL ||
+                               strstr(mat_name, "nodraw_notsolid") != NULL ||
+                               strstr(mat_name, "nosight_noclip") != NULL ||
+                               strstr(mat_name, "notsolid") != NULL ||
+                               strstr(mat_name, "descript") != NULL ||
+                               strstr(mat_name, "aitrig") != NULL ||
+                               strstr(mat_name, "spawner_trigger") != NULL ||
+                               strstr(mat_name, "occluder") != NULL ||
+                               (cflags & 0x40000000) != 0 /* TRIGGER */);
+
+                if (!is_tool) {
+                    float d0 = brushsides[side_idx + 0].column1.dist;
+                    float d1 = brushsides[side_idx + 1].column1.dist;
+                    float d2 = brushsides[side_idx + 2].column1.dist;
+                    float d3 = brushsides[side_idx + 3].column1.dist;
+                    float d4 = brushsides[side_idx + 4].column1.dist;
+                    float d5 = brushsides[side_idx + 5].column1.dist;
+
+                    float min_x = (d0 < d1) ? d0 : d1;
+                    float max_x = (d0 < d1) ? d1 : d0;
+                    float min_y = (d2 < d3) ? d2 : d3;
+                    float max_y = (d2 < d3) ? d3 : d2;
+                    float min_z = (d4 < d5) ? d4 : d5;
+                    float max_z = (d4 < d5) ? d5 : d4;
+
+                    /* Skip degenerate zero-volume brushes */
+                    if ((max_x - min_x) >= 0.1f && (max_y - min_y) >= 0.1f && (max_z - min_z) >= 0.1f) {
+                        sb_append(&sb, "brush {\n");
+                        sb_append_f(&sb, "  mins %.1f %.1f %.1f\n", min_x, min_y, min_z);
+                        sb_append_f(&sb, "  maxs %.1f %.1f %.1f\n", max_x, max_y, max_z);
+
+                        if (num_sides > 6 && planes) {
+                            unsigned int s;
+                            sb_append_f(&sb, "  plane -1.0 0.0 0.0 %.1f\n", -min_x);
+                            sb_append_f(&sb, "  plane 1.0 0.0 0.0 %.1f\n", max_x);
+                            sb_append_f(&sb, "  plane 0.0 -1.0 0.0 %.1f\n", -min_y);
+                            sb_append_f(&sb, "  plane 0.0 1.0 0.0 %.1f\n", max_y);
+                            sb_append_f(&sb, "  plane 0.0 0.0 -1.0 %.1f\n", -min_z);
+                            sb_append_f(&sb, "  plane 0.0 0.0 1.0 %.1f\n", max_z);
+                            for (s = 6; s < num_sides; s++) {
+                                unsigned int p_idx = brushsides[side_idx + s].column1.plane;
+                                if (p_idx < num_planes) {
+                                    const CoD1Plane* pl = &planes[p_idx];
+                                    sb_append_f(&sb, "  plane %.4f %.4f %.4f %.2f\n",
+                                                pl->normal[0], pl->normal[1], pl->normal[2], pl->dist);
+                                }
+                            }
+                        }
+
+                        sb_append(&sb, "  material \"textures/common/nodraw\"\n");
+                        sb_append(&sb, "  contents solid\n");
+                        sb_append(&sb, "}\n\n");
+                        brushes_emitted++;
+                    }
+                }
+            }
+            side_idx += num_sides;
+        }
+    }
+
+    /* 3. Parse TriangleSoups (Lump 6), Vertices (Lump 7), MeshVerts (Lump 8) */
+    if (lumps[LUMP_TRIANGLESOUPS].length > 0 &&
         lumps[LUMP_VERTICES].length > 0 &&
         lumps[LUMP_MESHVERTS].length > 0) {
-
-        unsigned int num_materials = lumps[LUMP_MATERIALS].length / sizeof(CoDMaterial);
-        const CoDMaterial* materials = (const CoDMaterial*)(bytes + lumps[LUMP_MATERIALS].offset);
 
         unsigned int num_soups = lumps[LUMP_TRIANGLESOUPS].length / sizeof(CoDTriangleSoup);
         if (lumps[LUMP_MODELS].length >= sizeof(CoD1Model)) {
@@ -336,12 +470,11 @@ int cod_bsp_to_hxmap(const void* data, size_t size, const char* map_name,
             if ((unsigned int)soup->triangle_offset + soup->triangle_count > num_indices) continue;
 
             const char* mat_name = "textures/dev/floor";
-            if (soup->material_id < num_materials && materials[soup->material_id].name[0]) {
+            if (materials && soup->material_id < num_materials && materials[soup->material_id].name[0]) {
                 mat_name = materials[soup->material_id].name;
             }
 
-            const char* cont = "solid";
-            unsigned int cflags = (soup->material_id < num_materials) ? materials[soup->material_id].content_flags : 0;
+            unsigned int cflags = (materials && soup->material_id < num_materials) ? materials[soup->material_id].content_flags : 0;
             int is_tool = (strstr(mat_name, "portal") != NULL ||
                            strstr(mat_name, "trigger") != NULL ||
                            strstr(mat_name, "clipmissile") != NULL ||
@@ -374,6 +507,8 @@ int cod_bsp_to_hxmap(const void* data, size_t size, const char* map_name,
                            strstr(mat_name, "clipshot") != NULL ||
                            (cflags & 0x40000000) != 0 /* TRIGGER */ ||
                            (cflags & 0x20000) != 0 /* MONSTERCLIP */);
+            if (is_tool) continue;
+
             int is_foliage = (strstr(mat_name, "foliage") != NULL ||
                               strstr(mat_name, "bush") != NULL ||
                               strstr(mat_name, "plant") != NULL ||
@@ -382,9 +517,55 @@ int cod_bsp_to_hxmap(const void* data, size_t size, const char* map_name,
                               strstr(mat_name, "ivy") != NULL ||
                               strstr(mat_name, "hedge") != NULL ||
                               strstr(mat_name, "treeline") != NULL);
-            if (is_tool || (is_foliage && !(cflags & 0x10001)) ||
-                ((cflags & 0x20000000) /* TRANSLUCENT */ && !(cflags & 0x10001))) {
-                cont = "nonsolid";
+
+            const char* cont = "nonsolid";
+            if (brushes_emitted == 0) {
+                if (!is_foliage && !((cflags & 0x20000000) && !(cflags & 0x10001))) {
+                    cont = "solid";
+                }
+            } else {
+                int is_walkable = 0;
+                if (!is_foliage) {
+                    if (strstr(mat_name, "ground") != NULL ||
+                        strstr(mat_name, "terrain") != NULL ||
+                        strstr(mat_name, "dirt") != NULL ||
+                        strstr(mat_name, "grass") != NULL ||
+                        strstr(mat_name, "snow") != NULL ||
+                        strstr(mat_name, "mud") != NULL ||
+                        strstr(mat_name, "sand") != NULL ||
+                        strstr(mat_name, "rock") != NULL ||
+                        strstr(mat_name, "gravel") != NULL ||
+                        strstr(mat_name, "path") != NULL ||
+                        strstr(mat_name, "road") != NULL ||
+                        strstr(mat_name, "floor") != NULL) {
+                        is_walkable = 1;
+                    } else {
+                        /* Check if any triangle in this soup has upward-facing normal */
+                        for (t = 0; t + 2 < soup->triangle_count; t += 3) {
+                            unsigned short idx0 = indices[soup->triangle_offset + t];
+                            unsigned short idx1 = indices[soup->triangle_offset + t + 1];
+                            unsigned short idx2 = indices[soup->triangle_offset + t + 2];
+                            if (idx0 < soup->vertex_count && idx1 < soup->vertex_count && idx2 < soup->vertex_count) {
+                                const float* p0 = verts[soup->vertex_offset + idx0].pos;
+                                const float* p1 = verts[soup->vertex_offset + idx1].pos;
+                                const float* p2 = verts[soup->vertex_offset + idx2].pos;
+                                float e1x = p1[0] - p0[0], e1y = p1[1] - p0[1], e1z = p1[2] - p0[2];
+                                float e2x = p2[0] - p0[0], e2y = p2[1] - p0[1], e2z = p2[2] - p0[2];
+                                float c_nz = e1x * e2y - e1y * e2x;
+                                float c_nx = e1y * e2z - e1z * e2y;
+                                float c_ny = e1z * e2x - e1x * e2z;
+                                float len_sq = c_nx * c_nx + c_ny * c_ny + c_nz * c_nz;
+                                if (len_sq > 1e-8f && (c_nz * c_nz) >= 0.3025f * len_sq) {
+                                    is_walkable = 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (is_walkable) {
+                    cont = "solid";
+                }
             }
 
             sb_append(&sb, "mesh {\n");
@@ -412,8 +593,8 @@ int cod_bsp_to_hxmap(const void* data, size_t size, const char* map_name,
             meshes_emitted++;
         }
 
-        /* If no meshes were emitted, fallback to a walkable floor brush */
-        if (meshes_emitted == 0) {
+        /* If no meshes and no brushes were emitted, fallback to a walkable floor brush */
+        if (meshes_emitted == 0 && brushes_emitted == 0) {
             float fmin_x = min_world[0] - 256.f;
             float fmin_y = min_world[1] - 256.f;
             float fmax_x = max_world[0] + 256.f;
