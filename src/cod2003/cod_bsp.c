@@ -477,6 +477,7 @@ int cod_bsp_to_hxmap(const void* data, size_t size, const char* map_name,
             }
 
             unsigned int cflags = (materials && soup->material_id < num_materials) ? materials[soup->material_id].content_flags : 0;
+            int is_decal = (strstr(mat_name, "decal") != NULL && strstr(mat_name, "window") == NULL);
             int is_tool = (strstr(mat_name, "portal") != NULL ||
                            strstr(mat_name, "trigger") != NULL ||
                            strstr(mat_name, "clipmissile") != NULL ||
@@ -488,7 +489,7 @@ int cod_bsp_to_hxmap(const void* data, size_t size, const char* map_name,
                            strstr(mat_name, "lightgrid") != NULL ||
                            strstr(mat_name, "origin") != NULL ||
                            strstr(mat_name, "sky") != NULL ||
-                           strstr(mat_name, "decal") != NULL ||
+                           is_decal ||
                            strstr(mat_name, "shadow") != NULL ||
                            strstr(mat_name, "clipmonster") != NULL ||
                            strstr(mat_name, "clipfoliage") != NULL ||
@@ -525,7 +526,7 @@ int cod_bsp_to_hxmap(const void* data, size_t size, const char* map_name,
                     cont = "solid";
                 }
             } else {
-                int is_terrain = 0;
+                int is_solid_structure = 0;
                 if (!is_foliage) {
                     if (strstr(mat_name, "ground") != NULL ||
                         strstr(mat_name, "terrain") != NULL ||
@@ -536,11 +537,22 @@ int cod_bsp_to_hxmap(const void* data, size_t size, const char* map_name,
                         strstr(mat_name, "sand") != NULL ||
                         strstr(mat_name, "gravel") != NULL ||
                         strstr(mat_name, "path") != NULL ||
-                        strstr(mat_name, "road") != NULL) {
-                        is_terrain = 1;
+                        strstr(mat_name, "road") != NULL ||
+                        strstr(mat_name, "wood") != NULL ||
+                        strstr(mat_name, "plank") != NULL ||
+                        strstr(mat_name, "board") != NULL ||
+                        strstr(mat_name, "ramp") != NULL ||
+                        strstr(mat_name, "catwalk") != NULL ||
+                        strstr(mat_name, "stair") != NULL ||
+                        strstr(mat_name, "step") != NULL ||
+                        strstr(mat_name, "bridge") != NULL ||
+                        strstr(mat_name, "dock") != NULL ||
+                        strstr(mat_name, "pier") != NULL ||
+                        strstr(mat_name, "floor") != NULL) {
+                        is_solid_structure = 1;
                     }
                 }
-                if (is_terrain) {
+                if (is_solid_structure) {
                     cont = "solid";
                 }
             }
