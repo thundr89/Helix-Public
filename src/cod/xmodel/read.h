@@ -46,6 +46,17 @@ int cod_xmodel_lod_slots(const void* data, size_t size, CodXmodelLod* out, int c
 /* Viewmodels keep a hand skin. Body models drop it when another skin exists. */
 void cod_xmodel_set_keep_hands(int keep);
 
+typedef struct CodXmodelBoneRule {
+    int one_based;       /* 1: surf N -> parts[N-1]. 0: surf N -> parts[N]. */
+    int parent0_is_root; /* 1: parent byte 0 is a root. 0: parent byte 0 is bone 0. */
+} CodXmodelBoneRule;
+
+void cod_xmodel_set_bone_rule(CodXmodelBoneRule rule);
+CodXmodelBoneRule cod_xmodel_bone_rule(void);
+
+/* World translation of each bone, xyz packed. Returns the bone count, or 0. */
+int cod_xmodel_world_translations(const void* parts, size_t size, float* out_xyz, int cap);
+
 /* Image names in the contiguous .dds/.tga/.jpg/.png run at the end of the xmodel.
  * `names` is cap rows of 160 chars. Returns the count. Does not sort and does not add skins/. */
 int cod_xmodel_skin_names(const void* xmodel, size_t size, char names[][160], int cap);

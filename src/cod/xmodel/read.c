@@ -63,8 +63,13 @@ typedef struct {
 static char g_mats[64][160];
 static int g_nmat = 0;
 static int g_keep_hands = 0;
+static CodXmodelBoneRule g_bone_rule = {1, 0};
 
 void cod_xmodel_set_keep_hands(int keep) { g_keep_hands = keep ? 1 : 0; }
+
+void cod_xmodel_set_bone_rule(CodXmodelBoneRule rule) { g_bone_rule = rule; }
+
+CodXmodelBoneRule cod_xmodel_bone_rule(void) { return g_bone_rule; }
 
 static int xsb_init(Xsb* sb) {
     sb->cap = 4096;
@@ -242,6 +247,197 @@ static void quat_rot(const float q[4], const float v[3], float o[3]) {
     o[2] = v[2] + q[3] * tz + (q[0] * ty - q[1] * tx);
 }
 
+static void bone_identity(CoD1Bone* b) {
+    b->trans[0] = b->trans[1] = b->trans[2] = 0.f;
+    b->q[0] = b->q[1] = b->q[2] = 0.f;
+    b->q[3] = 1.f;
+}
+
+static void bone_copy(const CoD1Bone* src, CoD1Bone* dst) {
+    dst->parent = src->parent;
+    dst->trans[0] = src->trans[0];
+    dst->trans[1] = src->trans[1];
+    dst->trans[2] = src->trans[2];
+    dst->q[0] = src->q[0];
+    dst->q[1] = src->q[1];
+    dst->q[2] = src->q[2];
+    dst->q[3] = src->q[3];
+}
+
+static void bone_compose_world(const CoD1Bone* parent, const CoD1Bone* local, CoD1Bone* world) {
+    float nt[3], nq[4];
+    quat_rot(parent->q, local->trans, nt);
+    world->trans[0] = nt[0] + parent->trans[0];
+    world->trans[1] = nt[1] + parent->trans[1];
+    world->trans[2] = nt[2] + parent->trans[2];
+    quat_mul(parent->q, local->q, nq);
+    world->q[0] = nq[0];
+    world->q[1] = nq[1];
+    world->q[2] = nq[2];
+    world->q[3] = nq[3];
+}
+
+static int resolve_bone_parent(unsigned char parent_byte, int bone_index, CodXmodelBoneRule rule) {
+    if (parent_byte == 255 || parent_byte == (unsigned char)bone_index) return -1;
+    if (rule.parent0_is_root && parent_byte == 0) return -1;
+    return (int)parent_byte;
+}
+
+static int read_cod1_bone_local(const unsigned char* parts, size_t parts_size, int bi, CoD1Bone* out) {
+    size_t b_off = 6 + (size_t)bi * 19;
+    short qx, qy, qz;
+    float x, y, z, w2;
+    unsigned char parent_byte;
+
+    if (b_off + 19 > parts_size) return 0;
+    parent_byte = parts[b_off];
+    out->parent = resolve_bone_parent(parent_byte, bi, g_bone_rule);
+    b_off += 1;
+    memcpy(&out->trans[0], parts + b_off, 4);
+    b_off += 4;
+    memcpy(&out->trans[1], parts + b_off, 4);
+    b_off += 4;
+    memcpy(&out->trans[2], parts + b_off, 4);
+    b_off += 4;
+    qx = (short)(parts[b_off] | (parts[b_off + 1] << 8));
+    qy = (short)(parts[b_off + 2] | (parts[b_off + 3] << 8));
+    qz = (short)(parts[b_off + 4] | (parts[b_off + 5] << 8));
+    x = (float)qx / 32767.f;
+    y = (float)qy / 32767.f;
+    z = (float)qz / 32767.f;
+    w2 = 1.f - x * x - y * y - z * z;
+    out->q[0] = x;
+    out->q[1] = y;
+    out->q[2] = z;
+    out->q[3] = w2 > 0.f ? sqrtf(w2) : 0.f;
+    return 1;
+}
+
+typedef struct {
+    char* on_stack;
+    char* baked;
+    int* stack;
+    int stack_len;
+} BoneBakeCtx;
+
+static void bake_bone_dfs(int i, int num_bones, const CoD1Bone* locals, CoD1Bone* worlds, BoneBakeCtx* ctx) {
+    int p;
+    int k;
+
+    if (ctx->baked[i]) return;
+    if (ctx->on_stack[i]) {
+        for (k = 0; k < ctx->stack_len; k++) {
+            int j = ctx->stack[k];
+            bone_identity(&worlds[j]);
+            ctx->baked[j] = 1;
+        }
+        return;
+    }
+    ctx->on_stack[i] = 1;
+    ctx->stack[ctx->stack_len++] = i;
+    p = locals[i].parent;
+    if (p >= 0 && p < num_bones) {
+        bake_bone_dfs(p, num_bones, locals, worlds, ctx);
+        if (ctx->baked[i]) {
+            ctx->stack_len--;
+            ctx->on_stack[i] = 0;
+            return;
+        }
+        bone_compose_world(&worlds[p], &locals[i], &worlds[i]);
+    } else if (p >= num_bones) {
+        bone_identity(&worlds[i]);
+    } else {
+        bone_copy(&locals[i], &worlds[i]);
+    }
+    ctx->stack_len--;
+    ctx->on_stack[i] = 0;
+    ctx->baked[i] = 1;
+}
+
+static void bake_bone_worlds(const CoD1Bone* locals, CoD1Bone* worlds, int num_bones) {
+    BoneBakeCtx ctx;
+    int i;
+
+    if (num_bones <= 0) return;
+    ctx.on_stack = (char*)calloc((size_t)num_bones, 1);
+    ctx.baked = (char*)calloc((size_t)num_bones, 1);
+    ctx.stack = (int*)malloc((size_t)num_bones * sizeof(int));
+    ctx.stack_len = 0;
+    if (!ctx.on_stack || !ctx.baked || !ctx.stack) {
+        free(ctx.on_stack);
+        free(ctx.baked);
+        free(ctx.stack);
+        return;
+    }
+    for (i = 0; i < num_bones; i++) {
+        if (!ctx.baked[i]) bake_bone_dfs(i, num_bones, locals, worlds, &ctx);
+    }
+    free(ctx.on_stack);
+    free(ctx.baked);
+    free(ctx.stack);
+}
+
+static int cod_xmodel_load_bones(const unsigned char* parts, size_t parts_size, CoD1Bone** out_locals,
+                                 CoD1Bone** out_worlds, unsigned short* out_num_bones) {
+    size_t p_off = 0;
+    unsigned short p_ver = 0, p_num_bones = 0, p_unk = 0;
+    CoD1Bone* locals = NULL;
+    CoD1Bone* worlds = NULL;
+    unsigned short bi;
+
+    *out_locals = NULL;
+    *out_worlds = NULL;
+    *out_num_bones = 0;
+    if (!parts || parts_size < 6) return 0;
+    if (!ru16(parts, parts_size, &p_off, &p_ver) || !ru16(parts, parts_size, &p_off, &p_num_bones) ||
+        !ru16(parts, parts_size, &p_off, &p_unk))
+        return 0;
+    (void)p_unk;
+    if (p_ver != 14 || p_num_bones == 0 || p_num_bones > 256) return 0;
+    locals = (CoD1Bone*)calloc(p_num_bones, sizeof(CoD1Bone));
+    worlds = (CoD1Bone*)calloc(p_num_bones, sizeof(CoD1Bone));
+    if (!locals || !worlds) {
+        free(locals);
+        free(worlds);
+        return 0;
+    }
+    for (bi = 0; bi < p_num_bones; bi++) {
+        if (!read_cod1_bone_local(parts, parts_size, (int)bi, &locals[bi])) {
+            free(locals);
+            free(worlds);
+            return 0;
+        }
+    }
+    bake_bone_worlds(locals, worlds, (int)p_num_bones);
+    *out_locals = locals;
+    *out_worlds = worlds;
+    *out_num_bones = p_num_bones;
+    return 1;
+}
+
+int cod_xmodel_world_translations(const void* parts, size_t size, float* out_xyz, int cap) {
+    CoD1Bone* locals = NULL;
+    CoD1Bone* worlds = NULL;
+    unsigned short num_bones = 0;
+    int i;
+
+    if (!out_xyz || cap <= 0) return 0;
+    if (!cod_xmodel_load_bones((const unsigned char*)parts, size, &locals, &worlds, &num_bones)) return 0;
+    if ((int)num_bones > cap) {
+        free(locals);
+        free(worlds);
+        return 0;
+    }
+    for (i = 0; i < (int)num_bones; i++) {
+        out_xyz[i * 3 + 0] = worlds[i].trans[0];
+        out_xyz[i * 3 + 1] = worlds[i].trans[1];
+        out_xyz[i * 3 + 2] = worlds[i].trans[2];
+    }
+    free(locals);
+    free(worlds);
+    return (int)num_bones;
+}
+
 /* Retail CoD1 surfs. Rigid verts with bone > 0 are translated by xmodelparts bind pose. */
 static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
                           const unsigned char* parts, size_t parts_size, Xsb* sb) {
@@ -249,81 +445,13 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
     unsigned short m;
     int vert_base = 1;
     CoD1Bone* bones = NULL;
-    unsigned short p_ver = 0, p_num_bones = 0, p_unk = 0;
-    size_t p_off = 0;
+    CoD1Bone* bone_locals = NULL;
+    unsigned short p_num_bones = 0;
 
     if (parts && parts_size >= 6 &&
-        ru16(parts, parts_size, &p_off, &p_ver) &&
-        ru16(parts, parts_size, &p_off, &p_num_bones) &&
-        ru16(parts, parts_size, &p_off, &p_unk)) {
-        if (p_ver == 14 && p_num_bones > 0 && p_num_bones <= 256) {
-            bones = (CoD1Bone*)calloc(p_num_bones, sizeof(CoD1Bone));
-            if (bones) {
-                unsigned short bi;
-                for (bi = 0; bi < p_num_bones; bi++) {
-                    size_t b_off = 6 + (size_t)bi * 19;
-                    short qx = 0, qy = 0, qz = 0;
-                    float x, y, z, w2;
-                    bones[bi].parent = -1;
-                    bones[bi].q[0] = bones[bi].q[1] = bones[bi].q[2] = 0.f;
-                    bones[bi].q[3] = 1.f;
-                    if (b_off + 19 > parts_size) continue;
-                    bones[bi].parent = parts[b_off];
-                    if (bones[bi].parent == 255) bones[bi].parent = -1;
-                    b_off += 1;
-                    rf32(parts, parts_size, &b_off, &bones[bi].trans[0]);
-                    rf32(parts, parts_size, &b_off, &bones[bi].trans[1]);
-                    rf32(parts, parts_size, &b_off, &bones[bi].trans[2]);
-                    qx = (short)(parts[b_off] | (parts[b_off + 1] << 8));
-                    qy = (short)(parts[b_off + 2] | (parts[b_off + 3] << 8));
-                    qz = (short)(parts[b_off + 4] | (parts[b_off + 5] << 8));
-                    x = (float)qx / 32767.f;
-                    y = (float)qy / 32767.f;
-                    z = (float)qz / 32767.f;
-                    w2 = 1.f - x * x - y * y - z * z;
-                    bones[bi].q[0] = x;
-                    bones[bi].q[1] = y;
-                    bones[bi].q[2] = z;
-                    bones[bi].q[3] = w2 > 0.f ? sqrtf(w2) : 0.f;
-                }
-                for (bi = 0; bi < p_num_bones; bi++) {
-                    float q[4], t[3];
-                    int p = bones[bi].parent;
-                    int guard = 0;
-                    q[0] = bones[bi].q[0];
-                    q[1] = bones[bi].q[1];
-                    q[2] = bones[bi].q[2];
-                    q[3] = bones[bi].q[3];
-                    t[0] = bones[bi].trans[0];
-                    t[1] = bones[bi].trans[1];
-                    t[2] = bones[bi].trans[2];
-                    while (p >= 0 && p < (int)p_num_bones && p != (int)bi && guard++ < 32) {
-                        float nq[4], nt[3];
-                        quat_rot(bones[p].q, t, nt);
-                        nt[0] += bones[p].trans[0];
-                        nt[1] += bones[p].trans[1];
-                        nt[2] += bones[p].trans[2];
-                        quat_mul(bones[p].q, q, nq);
-                        q[0] = nq[0];
-                        q[1] = nq[1];
-                        q[2] = nq[2];
-                        q[3] = nq[3];
-                        t[0] = nt[0];
-                        t[1] = nt[1];
-                        t[2] = nt[2];
-                        if (bones[p].parent == p) break;
-                        p = bones[p].parent;
-                    }
-                    bones[bi].q[0] = q[0];
-                    bones[bi].q[1] = q[1];
-                    bones[bi].q[2] = q[2];
-                    bones[bi].q[3] = q[3];
-                    bones[bi].trans[0] = t[0];
-                    bones[bi].trans[1] = t[1];
-                    bones[bi].trans[2] = t[2];
-                }
-            }
-        }
+        cod_xmodel_load_bones(parts, parts_size, &bone_locals, &bones, &p_num_bones)) {
+        free(bone_locals);
+        bone_locals = NULL;
     }
 
     if (!ru16(p, size, &off, &num_meshes)) {

@@ -1296,6 +1296,50 @@ static void test_gsc_vm(void) {
     report("test_gsc_vm", before);
 }
 
+static void test_xmodel_bone_once(void) {
+    int before = checkpoint();
+    unsigned char parts[6 + 19 * 2];
+    float xyz[6];
+    CodXmodelBoneRule rule;
+    int n;
+    memset(parts, 0, sizeof(parts));
+    put_u16(parts + 0, 14);
+    put_u16(parts + 2, 2);
+    put_u16(parts + 4, 1);
+    /* bone 0 parent = 1 (higher index), translation (1,0,0), quat 0 */
+    parts[6] = 1;
+    put_f32(parts + 7, 1.f);
+    /* bone 1 parent = 255, translation (0,0,10) */
+    parts[6 + 19] = 255;
+    put_f32(parts + 6 + 19 + 1 + 8, 10.f);
+    rule.one_based = 1;
+    rule.parent0_is_root = 0;
+    cod_xmodel_set_bone_rule(rule);
+    n = cod_xmodel_world_translations(parts, sizeof(parts), xyz, 2);
+    expect(n == 2, "two bones");
+    expect(xyz[3] == 0.f && xyz[4] == 0.f && xyz[5] == 10.f, "root stays");
+    expect(xyz[0] == 1.f && xyz[1] == 0.f && xyz[2] == 10.f, "child adds parent once");
+    /* Cycle: each parent points at the other. Both worlds are identity. */
+    parts[6] = 1;
+    parts[6 + 19] = 0;
+    n = cod_xmodel_world_translations(parts, sizeof(parts), xyz, 2);
+    expect(n == 2, "cycle count");
+    expect(xyz[0] == 0.f && xyz[1] == 0.f && xyz[2] == 0.f, "cycle bone 0 identity");
+    expect(xyz[3] == 0.f && xyz[4] == 0.f && xyz[5] == 0.f, "cycle bone 1 identity");
+    /* Quat shorts outside the unit sphere: w becomes 0 and the child translation stays finite. */
+    parts[6] = 1;
+    parts[6 + 19] = 255;
+    put_u16(parts + 6 + 19 + 13, 32767);
+    put_u16(parts + 6 + 19 + 15, 32767);
+    put_u16(parts + 6 + 19 + 17, 32767);
+    put_f32(parts + 7, 1.f);
+    put_f32(parts + 6 + 19 + 1 + 8, 0.f);
+    n = cod_xmodel_world_translations(parts, sizeof(parts), xyz, 2);
+    expect(n == 2, "oversize quat count");
+    expect(xyz[0] > -100.f && xyz[0] < 100.f, "oversize quat stays finite");
+    report("test_xmodel_bone_once", before);
+}
+
 int main(void) {
     test_plugin_create();
     test_archive_blob();
@@ -1305,6 +1349,7 @@ int main(void) {
     test_xmodel_lod_slots();
     test_xmodel_v14_surf();
     test_xmodel_skin_order();
+    test_xmodel_bone_once();
     test_sound_gameplay_alias();
     test_xanim();
     test_sound_ui_gsc();
