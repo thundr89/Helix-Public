@@ -46,6 +46,10 @@ int cod_xmodel_lod_slots(const void* data, size_t size, CodXmodelLod* out, int c
 /* Viewmodels keep a hand skin. Body models drop it when another skin exists. */
 void cod_xmodel_set_keep_hands(int keep);
 
+/* Image names in the contiguous .dds/.tga/.jpg/.png run at the end of the xmodel.
+ * `names` is cap rows of 160 chars. Returns the count. Does not sort and does not add skins/. */
+int cod_xmodel_skin_names(const void* xmodel, size_t size, char names[][160], int cap);
+
 /*
  * Convert an xmodel into OBJ text.
  * Text export: `surfs` and `parts` may be NULL.

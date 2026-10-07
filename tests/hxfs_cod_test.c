@@ -250,11 +250,73 @@ static void test_xmodel_v14_surf(void) {
         obj = NULL;
         sz = 0;
         expect(cod_xmodel_to_obj(skinxm, sizeof(skinxm), surf, sizeof(surf), NULL, 0, &obj, &sz) == 1, "skin obj");
-        expect(obj && strstr((const char*)obj, "usemtl skins/viewmodel@bar_body.png\n") != NULL, "body skin");
-        expect(obj && strstr((const char*)obj, "characterhand") != NULL, "keep hand");
+        expect(obj && strstr((const char*)obj, "usemtl skins/body@characterhand.png\n") != NULL, "first file-order skin");
     }
     free(obj);
     report("test_xmodel_v14_surf", before);
+}
+
+static void fill_one_tri(unsigned char* surf) {
+    size_t i;
+    memset(surf, 0, 20 + 3 * 32);
+    put_u16(surf + 0, 14);
+    put_u16(surf + 2, 1);
+    surf[5] = 3;
+    surf[7] = 1;
+    surf[13] = 3;
+    put_u16(surf + 14, 0);
+    put_u16(surf + 16, 1);
+    put_u16(surf + 18, 2);
+    for (i = 0; i < 3; i++) {
+        float pos[3];
+        pos[0] = (float)i;
+        pos[1] = 1.f;
+        pos[2] = 2.f;
+        memcpy(surf + 20 + i * 32 + 20, pos, sizeof(pos));
+    }
+}
+
+static void test_xmodel_skin_order(void) {
+    int before = checkpoint();
+    unsigned char xm[128];
+    unsigned char surf[20 + 3 * 32];
+    unsigned char* obj = NULL;
+    unsigned int sz = 0;
+    char names[4][160];
+    const char* a = "metal@ford.dds";
+    const char* b = "metal@fordhub.dds";
+    size_t n;
+    int count;
+    memset(xm, 0, sizeof(xm));
+    fill_one_tri(surf);
+    put_u16(xm, 14);
+    n = 2;
+    memcpy(xm + n, a, strlen(a) + 1); n += strlen(a) + 1;
+    memcpy(xm + n, b, strlen(b) + 1); n += strlen(b) + 1;
+    count = cod_xmodel_skin_names(xm, n, names, 4);
+    expect(count == 2, "two tail skins");
+    expect(strcmp(names[0], "metal@ford.dds") == 0, "file order");
+    expect(strcmp(names[1], "metal@fordhub.dds") == 0, "second skin kept");
+    cod_xmodel_set_keep_hands(0);
+    expect(cod_xmodel_to_obj(xm, n, surf, sizeof(surf), NULL, 0, &obj, &sz) == 1, "prop convert");
+    expect(obj && strstr((const char*)obj, "usemtl skins/metal@ford.png\n") != NULL, "first skin");
+    expect(obj && strstr((const char*)obj, "characterhand") == NULL, "prop path does not sort");
+    free(obj);
+    obj = NULL;
+    put_u16(xm, 14);
+    expect(cod_xmodel_to_obj(xm, 2, surf, sizeof(surf), NULL, 0, &obj, &sz) == 1, "no skins still converts");
+    expect(obj && strstr((const char*)obj, "usemtl skins/unbound.png\n") != NULL, "unbound");
+    free(obj);
+    obj = NULL;
+    n = 2;
+    memcpy(xm + n, "body@characterhand.dds", 22); n += 22;
+    memcpy(xm + n, "viewmodel@bar_body.dds", 22); n += 22;
+    cod_xmodel_set_keep_hands(1);
+    expect(cod_xmodel_to_obj(xm, n, surf, sizeof(surf), NULL, 0, &obj, &sz) == 1, "viewmodel skins");
+    expect(obj && strstr((const char*)obj, "usemtl skins/viewmodel@bar_body.png\n") != NULL, "hand sorted behind flag");
+    free(obj);
+    cod_xmodel_set_keep_hands(0);
+    report("test_xmodel_skin_order", before);
 }
 
 static void test_sound_gameplay_alias(void) {
@@ -1240,6 +1302,7 @@ int main(void) {
     test_xmodel_v14_lod();
     test_xmodel_lod_slots();
     test_xmodel_v14_surf();
+    test_xmodel_skin_order();
     test_sound_gameplay_alias();
     test_xanim();
     test_sound_ui_gsc();

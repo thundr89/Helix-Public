@@ -343,6 +343,9 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
                 free(bones);
                 return 0;
             }
+        } else if (!xsb_append_f(sb, "usemtl skins/unbound.png\n")) {
+            free(bones);
+            return 0;
         }
         unsigned short* tris = NULL;
         unsigned short* wcs = NULL;
@@ -734,6 +737,58 @@ static int image_ext(const char* s, size_t n) {
            cod_strcasecmp(s + n - 4, ".jpg") == 0 || cod_strcasecmp(s + n - 4, ".png") == 0;
 }
 
+static int scan_image_cstrings(const unsigned char* p, size_t size, size_t* starts, size_t* lens, int max) {
+    size_t i = 0;
+    int n = 0;
+    while (i < size && n < max) {
+        if (p[i] >= 32 && p[i] < 127) {
+            size_t start = i;
+            while (i < size && p[i] >= 32 && p[i] < 127) i++;
+            if (i < size && p[i] == 0) {
+                size_t len = i - start;
+                if (image_ext((const char*)p + start, len)) {
+                    starts[n] = start;
+                    lens[n] = len;
+                    n++;
+                }
+            }
+        } else {
+            i++;
+            continue;
+        }
+        i++;
+    }
+    return n;
+}
+
+int cod_xmodel_skin_names(const void* xmodel, size_t size, char names[][160], int cap) {
+    const unsigned char* p = (const unsigned char*)xmodel;
+    size_t starts[64];
+    size_t lens[64];
+    int n;
+    int run_start;
+    int out = 0;
+    int i;
+
+    if (!names || cap <= 0) return 0;
+    n = scan_image_cstrings(p, size, starts, lens, 64);
+    if (n == 0) return 0;
+    run_start = n - 1;
+    for (i = n - 1; i > 0; i--) {
+        if (starts[i - 1] + lens[i - 1] + 1 == starts[i])
+            run_start = i - 1;
+        else
+            break;
+    }
+    for (i = run_start; i < n && out < cap; i++) {
+        if (lens[i] + 1 > 160) continue;
+        memcpy(names[out], p + starts[i], lens[i]);
+        names[out][lens[i]] = '\0';
+        out++;
+    }
+    return out;
+}
+
 static void store_mat(const char* pick) {
     size_t n;
     char tmp[160];
@@ -771,31 +826,15 @@ static void sort_mats_non_hand_first(void) {
     memcpy(g_mats, temp, sizeof(temp));
 }
 
-/* Image cstrings in file order. All materials including hands are kept. */
 static void shader_names(const unsigned char* p, size_t size) {
-    size_t i = 0;
+    char raw[64][160];
+    int i;
+    int n;
     g_nmat = 0;
     if (!p) return;
-    while (i < size) {
-        if (p[i] >= 32 && p[i] < 127) {
-            size_t start = i;
-            while (i < size && p[i] >= 32 && p[i] < 127) i++;
-            if (i < size && p[i] == 0) {
-                size_t n = i - start;
-                if (image_ext((const char*)p + start, n) && n + 1 < 160) {
-                    char tmp[160];
-                    memcpy(tmp, p + start, n);
-                    tmp[n] = '\0';
-                    store_mat(tmp);
-                }
-            }
-        } else {
-            i++;
-            continue;
-        }
-        i++;
-    }
-    sort_mats_non_hand_first();
+    n = cod_xmodel_skin_names(p, size, raw, 64);
+    for (i = 0; i < n; i++) store_mat(raw[i]);
+    if (g_keep_hands) sort_mats_non_hand_first();
 }
 
 static int emit_text(const char* text, size_t size, Xsb* sb) {
