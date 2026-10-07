@@ -309,8 +309,10 @@ static void test_xmodel_skin_order(void) {
     free(obj);
     obj = NULL;
     n = 2;
-    memcpy(xm + n, "body@characterhand.dds", 22); n += 22;
-    memcpy(xm + n, "viewmodel@bar_body.dds", 22); n += 22;
+    memcpy(xm + n, "body@characterhand.dds", strlen("body@characterhand.dds") + 1);
+    n += strlen("body@characterhand.dds") + 1;
+    memcpy(xm + n, "viewmodel@bar_body.dds", strlen("viewmodel@bar_body.dds") + 1);
+    n += strlen("viewmodel@bar_body.dds") + 1;
     cod_xmodel_set_keep_hands(1);
     expect(cod_xmodel_to_obj(xm, n, surf, sizeof(surf), NULL, 0, &obj, &sz) == 1, "viewmodel skins");
     expect(obj && strstr((const char*)obj, "usemtl skins/viewmodel@bar_body.png\n") != NULL, "hand sorted behind flag");
