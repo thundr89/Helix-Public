@@ -209,6 +209,59 @@ static void test_xmodel_lod_slots(void) {
     report("test_xmodel_lod_slots", before);
 }
 
+static void test_xmodel_first_lod(void) {
+    int before = checkpoint();
+    CodArchive* a = cod_archive_create();
+    unsigned char header[96];
+    unsigned char hi[20 + 96];
+    unsigned char lo[20 + 96];
+    unsigned char* obj = NULL;
+    unsigned int sz = 0;
+    size_t hoff = 0;
+    size_t i;
+    memset(header, 0, sizeof(header));
+    memset(hi, 0, sizeof(hi));
+    memset(lo, 0, sizeof(lo));
+    put_u16(header + hoff, 14); hoff += 2; hoff += 24;
+    put_f32(header + hoff, 1000.f); hoff += 4;
+    memcpy(header + hoff, "hi0", 4); hoff += 4;
+    put_f32(header + hoff, 0.f); hoff += 4;
+    memcpy(header + hoff, "lo0", 4); hoff += 4;
+    put_u16(hi, 14); put_u16(hi + 2, 1);
+    hi[5] = 3; hi[7] = 1; hi[13] = 3;
+    put_u16(hi + 16, 1); put_u16(hi + 18, 2);
+    put_u16(lo, 14); put_u16(lo + 2, 1);
+    lo[5] = 3; lo[7] = 1; lo[13] = 3;
+    put_u16(lo + 16, 1); put_u16(lo + 18, 2);
+    for (i = 0; i < 3; i++) {
+        float p[3];
+        p[0] = 10.f; p[1] = 0.f; p[2] = 0.f;
+        memcpy(hi + 20 + i * 32 + 20, p, 12);
+        p[0] = 99.f;
+        memcpy(lo + 20 + i * 32 + 20, p, 12);
+    }
+    expect(cod_archive_add_blob(a, "xmodel/truck", header, (unsigned)hoff) == 1, "xm");
+    expect(cod_archive_add_blob(a, "xmodelsurfs/lo0", lo, sizeof(lo)) == 1, "lo");
+    expect(xmodel_to_helix(a, "xmodel/truck", &obj, &sz) == 1, "fallback lod");
+    expect(obj && strstr((const char*)obj, "v 99 ") != NULL, "low surf when hi is missing");
+    free(obj); obj = NULL;
+    expect(cod_archive_add_blob(a, "xmodelsurfs/hi0", hi, sizeof(hi)) == 1, "hi");
+    expect(xmodel_to_helix(a, "xmodel/truck", &obj, &sz) == 1, "near lod");
+    expect(obj && strstr((const char*)obj, "v 10 ") != NULL, "first named surf");
+    expect(obj && strstr((const char*)obj, "v 99 ") == NULL, "low surf not chosen by density");
+    free(obj);
+    obj = NULL;
+    expect(xmodel_to_helix(a, "xmodel/missing", &obj, &sz) == 0, "unknown model fails");
+    cod_archive_destroy(a);
+    /* Header only, no surf blobs: conversion fails. */
+    a = cod_archive_create();
+    expect(cod_archive_add_blob(a, "xmodel/truck", header, (unsigned)hoff) == 1, "xm only");
+    expect(xmodel_to_helix(a, "xmodel/truck", &obj, &sz) == 0, "no readable slot fails");
+    free(obj);
+    cod_archive_destroy(a);
+    report("test_xmodel_first_lod", before);
+}
+
 static void test_xmodel_v14_surf(void) {
     int before = checkpoint();
     unsigned char xm[2];
@@ -1500,6 +1553,7 @@ int main(void) {
     test_xmodel_through_archive();
     test_xmodel_v14_lod();
     test_xmodel_lod_slots();
+    test_xmodel_first_lod();
     test_xmodel_v14_surf();
     test_xmodel_skin_order();
     test_xmodel_bone_once();
