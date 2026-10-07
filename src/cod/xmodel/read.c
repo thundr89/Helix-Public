@@ -438,12 +438,13 @@ int cod_xmodel_world_translations(const void* parts, size_t size, float* out_xyz
     return (int)num_bones;
 }
 
-/* Retail CoD1 surfs. Rigid verts with bone > 0 are translated by xmodelparts bind pose. */
+/* Retail CoD1 surfs. Rigid verts are R * position + T from one baked world bone. */
 static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
                           const unsigned char* parts, size_t parts_size, Xsb* sb) {
     unsigned short num_meshes = 0;
     unsigned short m;
     int vert_base = 1;
+    int wrote = 0;
     CoD1Bone* bones = NULL;
     CoD1Bone* bone_locals = NULL;
     unsigned short p_num_bones = 0;
@@ -465,16 +466,6 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
 
     for (m = 0; m < num_meshes; m++) {
         unsigned short num_verts = 0, num_tris = 0, pad = 0, bone = 0;
-        if (g_nmat > 0) {
-            int idx = (int)m < g_nmat ? (int)m : g_nmat - 1;
-            if (!xsb_append_f(sb, "usemtl %s\n", g_mats[idx])) {
-                free(bones);
-                return 0;
-            }
-        } else if (!xsb_append_f(sb, "usemtl skins/unbound.png\n")) {
-            free(bones);
-            return 0;
-        }
         unsigned short* tris = NULL;
         unsigned short* wcs = NULL;
         int ntri = 0;
@@ -486,21 +477,24 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
         float tx = 0.f, ty = 0.f, tz = 0.f;
         const float* rq = NULL;
 
-        if (!need(off, 1, size)) { free(bones); return 0; }
+        if (!need(off, 1, size)) { free(bones); return wrote ? 1 : 0; }
         off++; /* unknown */
-        if (!ru16(p, size, &off, &num_verts) || !ru16(p, size, &off, &num_tris)) { free(bones); return 0; }
-        if (!ru16(p, size, &off, &pad) || !ru16(p, size, &off, &bone)) { free(bones); return 0; }
+        if (!ru16(p, size, &off, &num_verts) || !ru16(p, size, &off, &num_tris)) { free(bones); return wrote ? 1 : 0; }
+        if (!ru16(p, size, &off, &pad) || !ru16(p, size, &off, &bone)) { free(bones); return wrote ? 1 : 0; }
         (void)pad;
-        if (num_verts == 0 || num_tris == 0 || num_verts > 65535) { free(bones); return 0; }
+        if (num_verts == 0 || num_tris == 0 || num_verts > 65535) { free(bones); return wrote ? 1 : 0; }
         rigged = (bone == 65535);
         if (rigged) {
-            if (!need(off, 4, size)) { free(bones); return 0; }
+            if (!need(off, 4, size)) { free(bones); return wrote ? 1 : 0; }
             off += 4;
-        } else if (bones && bone > 0 && bone <= p_num_bones) {
-            tx = bones[bone - 1].trans[0];
-            ty = bones[bone - 1].trans[1];
-            tz = bones[bone - 1].trans[2];
-            rq = bones[bone - 1].q;
+        } else if (bones) {
+            int bi = g_bone_rule.one_based ? (int)bone - 1 : (int)bone;
+            if (bi >= 0 && bi < (int)p_num_bones) {
+                tx = bones[bi].trans[0];
+                ty = bones[bi].trans[1];
+                tz = bones[bi].trans[2];
+                rq = bones[bi].q;
+            }
         }
 
         tris = (unsigned short*)malloc((size_t)num_tris * 3 * sizeof(unsigned short));
@@ -508,7 +502,8 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
         if (!tris || !wcs) {
             free(tris);
             free(wcs);
-            return 0;
+            free(bones);
+            return wrote ? 1 : 0;
         }
 
         while (ok && ntri < (int)num_tris) {
@@ -592,7 +587,8 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
         if (!ok || stored != (int)num_tris) {
             free(tris);
             free(wcs);
-            return 0;
+            free(bones);
+            return wrote ? 1 : 0;
         }
 
         {
@@ -606,7 +602,7 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
                 free(tris);
                 free(wcs);
                 free(bones);
-                return 0;
+                return wrote ? 1 : 0;
             }
             for (v = 0; ok && v < num_verts; v++) {
                 unsigned short wc = 0, vb = 0;
@@ -653,12 +649,18 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
                             ws += wt;
                         }
                     }
-                    if (ok && ws > 0.001f) {
+                    if (ok && ws > 0.f) {
                         xyz[v * 3] = acc[0] / ws;
                         xyz[v * 3 + 1] = acc[1] / ws;
                         xyz[v * 3 + 2] = acc[2] / ws;
                     }
                 }
+            }
+            if (ok) {
+                if (g_nmat > 0) {
+                    int idx = (int)m < g_nmat ? (int)m : g_nmat - 1;
+                    if (!xsb_append_f(sb, "usemtl %s\n", g_mats[idx])) ok = 0;
+                } else if (!xsb_append_f(sb, "usemtl skins/unbound.png\n")) ok = 0;
             }
             for (v = 0; ok && v < num_verts; v++) {
                 float px = xyz[v * 3], py = xyz[v * 3 + 1], pz = xyz[v * 3 + 2];
@@ -692,8 +694,9 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
             free(tris);
             free(wcs);
             free(bones);
-            return 0;
+            return wrote ? 1 : 0;
         }
+        wrote = 1;
         {
             int t;
             for (t = 0; t < stored; t++) {
@@ -704,7 +707,7 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
                     free(tris);
                     free(wcs);
                     free(bones);
-                    return 0;
+                    return wrote ? 1 : 0;
                 }
             }
         }

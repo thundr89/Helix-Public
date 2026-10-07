@@ -1340,6 +1340,159 @@ static void test_xmodel_bone_once(void) {
     report("test_xmodel_bone_once", before);
 }
 
+static void test_xmodel_bind_apply(void) {
+    int before = checkpoint();
+    unsigned char parts[6 + 19];
+    unsigned char surf[20 + 3 * 32];
+    unsigned char xm[8];
+    unsigned char* obj = NULL;
+    unsigned int sz = 0;
+    CodXmodelBoneRule saved;
+    CodXmodelBoneRule rule;
+    size_t i;
+
+    saved = cod_xmodel_bone_rule();
+    memset(parts, 0, sizeof(parts));
+    put_u16(parts + 0, 14);
+    put_u16(parts + 2, 1);
+    parts[6] = 255;
+    put_f32(parts + 7, 4.f);
+    put_f32(parts + 11, 5.f);
+    put_f32(parts + 15, 6.f);
+    rule.one_based = 1;
+    rule.parent0_is_root = 0;
+    cod_xmodel_set_bone_rule(rule);
+    cod_xmodel_set_keep_hands(0);
+    put_u16(xm, 14);
+
+    fill_one_tri(surf);
+    put_u16(surf + 11, 1);
+    for (i = 0; i < 3; i++) {
+        put_f32(surf + 20 + i * 32 + 20, 0.f);
+        put_f32(surf + 20 + i * 32 + 24, 0.f);
+        put_f32(surf + 20 + i * 32 + 28, 0.f);
+    }
+    expect(cod_xmodel_to_obj(xm, 2, surf, sizeof(surf), parts, sizeof(parts), &obj, &sz) == 1, "rigid bone 1");
+    expect(obj && strstr((const char*)obj, "v 4 5 6\n") != NULL, "world translation");
+    free(obj);
+    obj = NULL;
+
+    put_u16(surf + 11, 9);
+    expect(cod_xmodel_to_obj(xm, 2, surf, sizeof(surf), parts, sizeof(parts), &obj, &sz) == 1, "rigid bone 9");
+    expect(obj && strstr((const char*)obj, "v 0 0 0\n") != NULL, "out of range stays origin");
+    free(obj);
+    obj = NULL;
+
+    {
+        unsigned char partial[20 + 3 * 32 + 1];
+        fill_one_tri(partial);
+        put_u16(partial + 2, 2);
+        partial[sizeof(partial) - 1] = 0;
+        expect(cod_xmodel_to_obj(xm, 2, partial, sizeof(partial), NULL, 0, &obj, &sz) == 1, "truncated second mesh kept");
+        expect(obj && strstr((const char*)obj, "v 0 1 2\n") != NULL, "first mesh vert remains");
+        free(obj);
+        obj = NULL;
+    }
+
+    {
+        /* A triangle needs three distinct indices. Vertex 0 carries the one weight. */
+        unsigned char rig[256];
+        size_t o = 0;
+        unsigned v;
+        memset(parts, 0, sizeof(parts));
+        put_u16(parts + 0, 14);
+        put_u16(parts + 2, 1);
+        parts[6] = 255;
+        put_f32(parts + 15, 5.f);
+        memset(rig, 0, sizeof(rig));
+        put_u16(rig + o, 14); o += 2;
+        put_u16(rig + o, 1); o += 2;
+        rig[o++] = 0;
+        put_u16(rig + o, 3); o += 2;
+        put_u16(rig + o, 1); o += 2;
+        put_u16(rig + o, 0); o += 2;
+        put_u16(rig + o, 65535); o += 2;
+        o += 4;
+        rig[o++] = 3;
+        put_u16(rig + o, 0); o += 2;
+        put_u16(rig + o, 1); o += 2;
+        put_u16(rig + o, 2); o += 2;
+        for (v = 0; v < 3; v++) {
+            o += 12 + 8;
+            put_u16(rig + o, v == 0 ? 1 : 0); o += 2;
+            put_u16(rig + o, 0); o += 2;
+            if (v == 0) {
+                put_f32(rig + o, 9.f); o += 4;
+                put_f32(rig + o, 9.f); o += 4;
+                put_f32(rig + o, 9.f); o += 4;
+                o += 4;
+            } else {
+                put_f32(rig + o, (float)(v + 2)); o += 4;
+                o += 8;
+            }
+        }
+        put_u16(rig + o, 0); o += 2;
+        put_f32(rig + o, 1.f); o += 4;
+        put_f32(rig + o, 1.f); o += 4;
+        o += 8;
+        expect(cod_xmodel_to_obj(xm, 2, rig, o, parts, sizeof(parts), &obj, &sz) == 1, "rigged mesh");
+        expect(obj && strstr((const char*)obj, "v 1 0 5\n") != NULL, "skinned world offset");
+        expect(obj && strstr((const char*)obj, "v 9 9 9\n") == NULL, "stored position ignored");
+        free(obj);
+        obj = NULL;
+    }
+
+    {
+        unsigned char one[20 + 3 * 32];
+        unsigned char two[4 + 112 * 2];
+        unsigned char skinxm[40];
+        const char* name = "metal@ford.dds";
+        const char* text;
+        const char* u1;
+        const char* u2;
+        const char* v1;
+        const char* v2;
+        size_t n;
+        fill_one_tri(one);
+        memset(two, 0, sizeof(two));
+        put_u16(two + 0, 14);
+        put_u16(two + 2, 2);
+        memcpy(two + 4, one + 4, 112);
+        memcpy(two + 4 + 112, one + 4, 112);
+        memset(skinxm, 0, sizeof(skinxm));
+        put_u16(skinxm, 14);
+        n = 2;
+        memcpy(skinxm + n, name, strlen(name) + 1);
+        n += strlen(name) + 1;
+        expect(cod_xmodel_to_obj(skinxm, n, two, sizeof(two), NULL, 0, &obj, &sz) == 1, "short skin block");
+        text = obj ? (const char*)obj : NULL;
+        u1 = text ? strstr(text, "usemtl skins/metal@ford.png\n") : NULL;
+        v1 = text ? strstr(text, "v 0 1 2\n") : NULL;
+        u2 = u1 ? strstr(u1 + 1, "usemtl skins/metal@ford.png\n") : NULL;
+        v2 = v1 ? strstr(v1 + 1, "v 0 1 2\n") : NULL;
+        expect(u1 && v1 && u1 < v1, "skin before first mesh");
+        expect(u2 && v2 && u2 < v2, "last skin before second mesh");
+        expect(text && strstr(text, "skins/unbound.png") == NULL, "short block is not unbound");
+        free(obj);
+        obj = NULL;
+    }
+
+    {
+        unsigned char empty[13];
+        memset(empty, 0, sizeof(empty));
+        put_u16(empty + 0, 14);
+        put_u16(empty + 2, 1);
+        put_u16(empty + 5, 3);
+        put_u16(empty + 7, 1);
+        expect(cod_xmodel_to_obj(xm, 2, empty, sizeof(empty), NULL, 0, &obj, &sz) == 0, "empty surf fails");
+        free(obj);
+        obj = NULL;
+    }
+
+    cod_xmodel_set_bone_rule(saved);
+    report("test_xmodel_bind_apply", before);
+}
+
 int main(void) {
     test_plugin_create();
     test_archive_blob();
@@ -1350,6 +1503,7 @@ int main(void) {
     test_xmodel_v14_surf();
     test_xmodel_skin_order();
     test_xmodel_bone_once();
+    test_xmodel_bind_apply();
     test_sound_gameplay_alias();
     test_xanim();
     test_sound_ui_gsc();
