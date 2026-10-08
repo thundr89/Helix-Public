@@ -37,6 +37,9 @@ int zip_contains(const ZipFile* p, const char* name);
  */
 int zip_read(const ZipFile* p, const char* name, unsigned char** out_buf, unsigned int* out_size);
 
+/* Stored CRC from the central directory. Does not inflate. */
+int zip_checksum(const ZipFile* p, const char* name, unsigned int* crc);
+
 /*
  * Unique virtual paths (last-wins). Heap array of heap strings.
  * Caller must zip_free_list().

@@ -290,6 +290,15 @@ int zip_contains(const ZipFile* p, const char* name) {
     return zip_find_last(p, name) >= 0;
 }
 
+int zip_checksum(const ZipFile* p, const char* name, unsigned int* crc) {
+    int idx;
+    if (!p || !crc) return 0;
+    idx = zip_find_last(p, name);
+    if (idx < 0) return 0;
+    *crc = p->files[idx].crc;
+    return 1;
+}
+
 int zip_read(const ZipFile* p, const char* name, unsigned char** out_buf, unsigned int* out_size) {
     int idx;
     unsigned char* buf;
