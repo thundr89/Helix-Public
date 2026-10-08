@@ -47,8 +47,8 @@ int cod_xmodel_lod_slots(const void* data, size_t size, CodXmodelLod* out, int c
 void cod_xmodel_set_keep_hands(int keep);
 
 typedef struct CodXmodelBoneRule {
-    int one_based;       /* 1: surf N -> parts[N-1]. 0: surf N -> parts[N]. */
-    int parent0_is_root; /* 1: parent byte 0 is a root. 0: parent byte 0 is bone 0. */
+    int one_based;       /* Unused. Placement uses the engine's 0-based part index. */
+    int parent0_is_root; /* Unused. Roots are the leading rootCount parts. */
 } CodXmodelBoneRule;
 
 void cod_xmodel_set_bone_rule(CodXmodelBoneRule rule);
@@ -57,7 +57,25 @@ CodXmodelBoneRule cod_xmodel_bone_rule(void);
 /* World translation of each bone, xyz packed. Returns the bone count, or 0. */
 int cod_xmodel_world_translations(const void* parts, size_t size, float* out_xyz, int cap);
 
-/* Image names in the contiguous .dds/.tga/.jpg/.png run at the end of the xmodel.
+/* cod_axes is column-major: [0..2] CoD X, [3..5] CoD Y, [6..8] CoD Z.
+   out is Xx Xy Xz Yx Yy Yz Zx Zy Zz Tx Ty Tz. Returns 1, or 0 if a pointer is NULL. */
+int cod_view_basis_rigid(const float cod_axes[9], const float cod_trans[3], float out[12]);
+
+/* Baked pose of `name`, in the Helix view basis. Returns 1 when the name is found.
+   A pose set with cod_xmodel_set_anim_pose replaces matching bone locals. */
+int cod_xmodel_view_tag(const void* parts, size_t size, const char* name, float out[12]);
+
+/* Frame 0 of a version-14 xanim. NULL clears. Returns 1 when a clip was stored. */
+int cod_xmodel_set_anim_pose(const void* xanim, size_t size);
+
+/* Merges frame 0 of another clip onto the pose. Bones already stored are replaced.
+   A failed clip leaves the pose as it was. Returns 1 when the clip was merged. */
+int cod_xmodel_overlay_anim_pose(const void* xanim, size_t size);
+
+/* Three lines. *out_buf is malloc'd. Returns 1. */
+int cod_viewhand_text(const float tag[12], unsigned char** out_buf, unsigned int* out_size);
+
+/* Surface names of the first named LOD, after the collision block.
  * `names` is cap rows of 160 chars. Returns the count. Does not sort and does not add skins/. */
 int cod_xmodel_skin_names(const void* xmodel, size_t size, char names[][160], int cap);
 

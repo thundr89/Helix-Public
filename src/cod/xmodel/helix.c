@@ -9,6 +9,7 @@
  */
 
 #include "xmodel/helix.h"
+#include "archive/archive.h"
 #include "xmodel/read.h"
 #include "cod_util.h"
 
@@ -17,6 +18,24 @@
 #include <string.h>
 
 static char g_player_body[160];
+
+/* Idle poses the fingers. Hip fire is frame 0 of ADS_up: CoD holds that clip
+ * at time 0 when the player is not aiming, and the clip only moves tag_torso.
+ * The aimed pose is the last frame of the same clip. */
+static void pose_mp44_hands(const CodArchive* ar) {
+    unsigned char* anim = NULL;
+    unsigned asz = 0;
+    cod_xmodel_set_anim_pose(NULL, 0);
+    if (!ar) return;
+    if (cod_archive_read(ar, "xanim/viewmodel_mp44_idle", &anim, &asz))
+        cod_xmodel_set_anim_pose(anim, asz);
+    free(anim);
+    anim = NULL;
+    asz = 0;
+    if (cod_archive_read(ar, "xanim/viewmodel_mp44_ADS_up", &anim, &asz))
+        cod_xmodel_overlay_anim_pose(anim, asz);
+    free(anim);
+}
 
 void cod_set_player_body(const char* xmodel) {
     g_player_body[0] = '\0';
@@ -50,7 +69,8 @@ static int rewrite_view_basis(unsigned char** buf, unsigned int* size) {
             if (line[0] == 'v' && line[1] == 'n' && line[2] == ' ') vn = 1;
             if ((vn || (line[0] == 'v' && line[1] == ' ')) &&
                 sscanf(line + (vn ? 3 : 2), "%f %f %f", &x, &y, &z) == 3) {
-                snprintf(line, sizeof(line), vn ? "vn %.6g %.6g %.6g" : "v %.6g %.6g %.6g", y, z, x);
+                /* Same P as cod_view_basis_rigid: CoD +Y becomes -right. */
+                snprintf(line, sizeof(line), vn ? "vn %.6g %.6g %.6g" : "v %.6g %.6g %.6g", -y, z, x);
                 src = line;
                 slen = strlen(line);
             }
@@ -117,6 +137,10 @@ int xmodel_to_helix(const CodArchive* ar, const char* name,
         return 0;
     }
     cod_xmodel_set_keep_hands(strstr(name, "viewmodel") != NULL);
+    if (strstr(name, "viewmodel_hands_whermact"))
+        pose_mp44_hands(ar);
+    else
+        cod_xmodel_set_anim_pose(NULL, 0);
     for (i = 0; i < nslots; i++) {
         unsigned char* obj = NULL;
         unsigned osz = 0;
@@ -142,10 +166,42 @@ int xmodel_to_helix(const CodArchive* ar, const char* name,
         break;
     }
     cod_xmodel_set_keep_hands(0);
+    cod_xmodel_set_anim_pose(NULL, 0);
     free(xm);
     if (!best) return 0;
     if (strstr(name, "viewmodel")) rewrite_view_basis(&best, &best_sz);
     *out_buf = best;
     *out_size = best_sz;
     return 1;
+}
+
+int cod_viewhand_file(const CodArchive* ar, unsigned char** out_buf, unsigned int* out_size) {
+    unsigned char* xm = NULL;
+    unsigned xsz = 0;
+    unsigned char* pt = NULL;
+    unsigned psz = 0;
+    CodXmodelLod slots[4];
+    int nslots, i;
+    float tag[12];
+    char parts_name[96];
+    if (!ar || !out_buf || !out_size) return 0;
+    if (!cod_archive_contains(ar, "xmodel/viewmodel_mp44")) return 0;
+    if (!cod_archive_read(ar, "xmodel/viewmodel_hands_whermact", &xm, &xsz)) return 0;
+    nslots = cod_xmodel_lod_slots(xm, xsz, slots, 4);
+    free(xm);
+    pose_mp44_hands(ar);
+    for (i = 0; i < nslots; i++) {
+        if (!slots[i].name[0]) continue;
+        snprintf(parts_name, sizeof(parts_name), "xmodelparts/%s", slots[i].name);
+        if (!cod_archive_read(ar, parts_name, &pt, &psz)) continue;
+        if (cod_xmodel_view_tag(pt, psz, "tag_weapon", tag)) {
+            free(pt);
+            cod_xmodel_set_anim_pose(NULL, 0);
+            return cod_viewhand_text(tag, out_buf, out_size);
+        }
+        free(pt);
+        pt = NULL;
+    }
+    cod_xmodel_set_anim_pose(NULL, 0);
+    return 0;
 }

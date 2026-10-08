@@ -221,3 +221,60 @@ add_test(NAME hxfs_pk4_test COMMAND hxfs_pk4_test)
 add_test(NAME hxfs_iwd_test COMMAND hxfs_iwd_test)
 add_test(NAME hxfs_ff_test COMMAND hxfs_ff_test)
 add_test(NAME cod2003_test COMMAND cod2003_test)
+
+# Modular CoD plugin. The game loads hxfs_cod.dll. src/cod2003 is not developed.
+set(HXFS_COD_SOURCES
+    ${HXFS_ZIP_CORE}
+    src/cod/archive/archive.c
+    src/cod/bsp/read.c
+    src/cod/bsp/names.c
+    src/cod/bsp/helix.c
+    src/cod/xmodel/read.c
+    src/cod/xmodel/helix.c
+    src/cod/xanim/read.c
+    src/cod/xanim/helix.c
+    src/cod/sound/read.c
+    src/cod/sound/helix.c
+    src/cod/ui/read.c
+    src/cod/ui/helix.c
+    src/cod/gsc/read.c
+    src/cod/gsc/helix.c
+    src/cod/gsc/vm.c
+    src/cod/gsc/compile.c
+    src/cod/texture/read.c
+    src/cod/texture/helix.c
+    src/cod/shader/read.c
+    src/cod/shader/helix.c
+    src/cod/cache.c
+    src/cod/plugin.c)
+
+add_library(hxfs_cod SHARED ${HXFS_COD_SOURCES})
+target_include_directories(hxfs_cod PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/helix-sdk"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/zip"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/cod")
+if(WIN32 AND ZLIB_STATIC_LIB)
+    target_link_libraries(hxfs_cod PRIVATE "${ZLIB_STATIC_LIB}")
+    target_link_options(hxfs_cod PRIVATE "-static-libgcc")
+else()
+    target_link_libraries(hxfs_cod PRIVATE ZLIB::ZLIB)
+endif()
+set_target_properties(hxfs_cod PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "hxfs_cod"
+    C_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON)
+
+if(WIN32)
+    target_compile_definitions(hxfs_cod PRIVATE HXFS_COD_EXPORTS)
+endif()
+
+add_executable(hxfs_cod_test
+    tests/hxfs_cod_test.c
+    ${HXFS_COD_SOURCES})
+target_include_directories(hxfs_cod_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/helix-sdk"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/zip"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/cod")
+target_link_libraries(hxfs_cod_test PRIVATE ZLIB::ZLIB)
+add_test(NAME hxfs_cod_test COMMAND hxfs_cod_test)

@@ -38,9 +38,24 @@
  *
  *   xmodelsurfs version 14 (retail CoD1), per mesh:
  *     u8 skip, u16 numVerts, u16 numTris, u16 pad, u16 bone
- *     bone == 65535: rigged, then 4 pad bytes; weights are skipped (bind pose)
+ *     bone is a 0-based part index. 65535 means skinned.
+ *
+ *   xmodelparts version 14:
+ *     u16 version, u16 childCount, u16 rootCount
+ *     childCount records of u8 parent, f32 trans[3], i16 quat[3]
+ *     The first rootCount parts are identity and have no record.
+ *     A parent index is absolute and lower than the child.
+ *
+ *   Surface names follow the collision block, one run per named LOD.
+ *     The names returned for a prop are the first named LOD's run.
  *     triangle strips: u8 count, then u16 indices
- *     each vert: f32 normal[3], f32 uv[2], (rigged: u16 weights, u16 bone), f32 pos[3]
+ *     rigid vert: f32 normal[3], f32 uv[2], f32 pos[3]
+ *     skinned mesh (bone 65535) starts with i16 weightedPointCount, i16 compactCount
+ *     skinned vert: f32 normal[3], f32 uv[2], i16 additiveCount, i16 bone, f32 pos[3]
+ *       and, when additiveCount != 0, f32 primaryWeight
+ *     then weightedPointCount blends: i16 bone, f32 pos[3], f32 weight
+ *     The bind pose is primaryWeight * bone(pos) plus each additive, not a
+ *     renormalized average. additiveCount 0 still transforms by its bone.
  *
  * ASCII XMODEL_EXPORT version 5 (Maya/Max tool output) is also accepted.
  */
@@ -64,6 +79,19 @@ static char g_mats[64][160];
 static int g_nmat = 0;
 static int g_keep_hands = 0;
 static CodXmodelBoneRule g_bone_rule = {1, 0};
+
+#define XANIM_POSE_MAX 128
+#define XANIM_PACKED_SCALE 3.0518509447574615e-05f
+#define XANIM_QUAT_REMAIN 1073676289u
+
+typedef struct {
+    char name[64];
+    float q[4];
+    float t[3];
+} XanimPoseBone;
+
+static XanimPoseBone g_pose[XANIM_POSE_MAX];
+static int g_pose_count = 0;
 
 void cod_xmodel_set_keep_hands(int keep) { g_keep_hands = keep ? 1 : 0; }
 
@@ -247,6 +275,21 @@ static void quat_rot(const float q[4], const float v[3], float o[3]) {
     o[2] = v[2] + q[3] * tz + (q[0] * ty - q[1] * tx);
 }
 
+/* World point from a baked bone. An index outside the skeleton stays local. */
+static void bone_point(const CoD1Bone* bones, unsigned count, int bi, const float in[3], float out[3]) {
+    if (bones && bi >= 0 && bi < (int)count) {
+        float r[3];
+        quat_rot(bones[bi].q, in, r);
+        out[0] = r[0] + bones[bi].trans[0];
+        out[1] = r[1] + bones[bi].trans[1];
+        out[2] = r[2] + bones[bi].trans[2];
+    } else {
+        out[0] = in[0];
+        out[1] = in[1];
+        out[2] = in[2];
+    }
+}
+
 static void bone_identity(CoD1Bone* b) {
     b->trans[0] = b->trans[1] = b->trans[2] = 0.f;
     b->q[0] = b->q[1] = b->q[2] = 0.f;
@@ -277,21 +320,16 @@ static void bone_compose_world(const CoD1Bone* parent, const CoD1Bone* local, Co
     world->q[3] = nq[3];
 }
 
-static int resolve_bone_parent(unsigned char parent_byte, int bone_index, CodXmodelBoneRule rule) {
-    if (parent_byte == 255 || parent_byte == (unsigned char)bone_index) return -1;
-    if (rule.parent0_is_root && parent_byte == 0) return -1;
-    return (int)parent_byte;
-}
-
-static int read_cod1_bone_local(const unsigned char* parts, size_t parts_size, int bi, CoD1Bone* out) {
-    size_t b_off = 6 + (size_t)bi * 19;
+static int read_child_bone(const unsigned char* parts, size_t parts_size, size_t rec, int bone_index,
+                           int num_bones, CoD1Bone* out) {
+    size_t b_off = rec;
     short qx, qy, qz;
     float x, y, z, w2;
     unsigned char parent_byte;
 
+    bone_identity(out);
     if (b_off + 19 > parts_size) return 0;
     parent_byte = parts[b_off];
-    out->parent = resolve_bone_parent(parent_byte, bi, g_bone_rule);
     b_off += 1;
     memcpy(&out->trans[0], parts + b_off, 4);
     b_off += 4;
@@ -310,6 +348,13 @@ static int read_cod1_bone_local(const unsigned char* parts, size_t parts_size, i
     out->q[1] = y;
     out->q[2] = z;
     out->q[3] = w2 > 0.f ? sqrtf(w2) : 0.f;
+    /* A parent at or past this bone is not a hierarchy the engine accepts. */
+    if ((int)parent_byte >= bone_index || (int)parent_byte >= num_bones) {
+        bone_identity(out);
+        out->parent = -1;
+    } else {
+        out->parent = (int)parent_byte;
+    }
     return 1;
 }
 
@@ -377,41 +422,331 @@ static void bake_bone_worlds(const CoD1Bone* locals, CoD1Bone* worlds, int num_b
     free(ctx.stack);
 }
 
+typedef struct {
+    const unsigned char* p;
+    size_t n;
+    size_t o;
+} PoseCur;
+
+static int pose_need(const PoseCur* c, size_t n) { return c->o + n <= c->n; }
+
+static int pose_u16(PoseCur* c, unsigned short* out) {
+    if (!pose_need(c, 2)) return 0;
+    *out = (unsigned short)(c->p[c->o] | (c->p[c->o + 1] << 8));
+    c->o += 2;
+    return 1;
+}
+
+static int pose_i16(PoseCur* c, short* out) {
+    unsigned short u;
+    if (!pose_u16(c, &u)) return 0;
+    *out = (short)u;
+    return 1;
+}
+
+static int pose_u8(PoseCur* c, unsigned char* out) {
+    if (!pose_need(c, 1)) return 0;
+    *out = c->p[c->o++];
+    return 1;
+}
+
+static int pose_f32(PoseCur* c, float* out) {
+    if (!pose_need(c, 4)) return 0;
+    memcpy(out, c->p + c->o, 4);
+    c->o += 4;
+    return 1;
+}
+
+static int pose_name(PoseCur* c, char* out, size_t cap) {
+    size_t end = c->o;
+    size_t n;
+    if (cap == 0) return 0;
+    while (end < c->n && c->p[end] != 0) end++;
+    if (end >= c->n) return 0;
+    n = end - c->o;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, c->p + c->o, n);
+    out[n] = 0;
+    c->o = end + 1;
+    return 1;
+}
+
+static int pose_quat_rest(unsigned int bits) {
+    int rem;
+    memcpy(&rem, &bits, sizeof(rem));
+    if (rem <= 0) return 0;
+    return (int)floor(sqrt((double)rem) + 0.5);
+}
+
+static void pose_normalize(float q[4]) {
+    float len = sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+    if (len > 1e-8f) {
+        q[0] /= len;
+        q[1] /= len;
+        q[2] /= len;
+        q[3] /= len;
+    } else {
+        q[0] = q[1] = q[2] = 0.f;
+        q[3] = 1.f;
+    }
+}
+
+static int pose_quat4(PoseCur* c, int negate, float q[4]) {
+    short s[3];
+    unsigned int bits = XANIM_QUAT_REMAIN;
+    int i;
+    int w;
+    for (i = 0; i < 3; i++) {
+        if (!pose_i16(c, &s[i])) return 0;
+        bits -= (unsigned int)((int)s[i] * (int)s[i]);
+    }
+    w = pose_quat_rest(bits);
+    q[0] = (float)s[0] * XANIM_PACKED_SCALE;
+    q[1] = (float)s[1] * XANIM_PACKED_SCALE;
+    q[2] = (float)s[2] * XANIM_PACKED_SCALE;
+    q[3] = (float)w * XANIM_PACKED_SCALE;
+    if (negate) {
+        q[0] = -q[0];
+        q[1] = -q[1];
+        q[2] = -q[2];
+        q[3] = -q[3];
+    }
+    pose_normalize(q);
+    return 1;
+}
+
+static int pose_quat2(PoseCur* c, int negate, float q[4]) {
+    short s;
+    unsigned int bits;
+    int w;
+    if (!pose_i16(c, &s)) return 0;
+    bits = XANIM_QUAT_REMAIN - (unsigned int)((int)s * (int)s);
+    w = pose_quat_rest(bits);
+    q[0] = 0.f;
+    q[1] = 0.f;
+    q[2] = (float)s * XANIM_PACKED_SCALE;
+    q[3] = (float)w * XANIM_PACKED_SCALE;
+    if (negate) {
+        q[2] = -q[2];
+        q[3] = -q[3];
+    }
+    pose_normalize(q);
+    return 1;
+}
+
+static int pose_skip(PoseCur* c, size_t n) {
+    if (!pose_need(c, n)) return 0;
+    c->o += n;
+    return 1;
+}
+
+/* Stores frame 0. Later frames are consumed so the next part stays aligned. */
+static int pose_rotation(PoseCur* c, int compressed, int negate, unsigned total, int small, float q[4]) {
+    unsigned short fc;
+    unsigned i;
+    if (!pose_u16(c, &fc) || fc > total) return 0;
+    if (fc == 0) {
+        q[0] = q[1] = q[2] = 0.f;
+        q[3] = 1.f;
+        return 1;
+    }
+    /* A single sample is inline. The key table exists only for a sparse run. */
+    if (fc > 1 && fc < total && !pose_skip(c, small ? fc : (size_t)fc * 2)) return 0;
+    for (i = 0; i < fc; i++) {
+        float tmp[4];
+        int neg = (i == 0) && negate;
+        if (compressed) {
+            if (!pose_quat2(c, neg, tmp)) return 0;
+        } else if (!pose_quat4(c, neg, tmp)) {
+            return 0;
+        }
+        if (i == 0) {
+            q[0] = tmp[0];
+            q[1] = tmp[1];
+            q[2] = tmp[2];
+            q[3] = tmp[3];
+        }
+    }
+    return 1;
+}
+
+static int pose_translation(PoseCur* c, unsigned total, int small, float t[3]) {
+    unsigned short fc;
+    unsigned i;
+    if (!pose_u16(c, &fc) || fc > total) return 0;
+    if (fc == 0) {
+        t[0] = t[1] = t[2] = 0.f;
+        return 1;
+    }
+    if (fc > 1 && fc < total && !pose_skip(c, small ? fc : (size_t)fc * 2)) return 0;
+    for (i = 0; i < fc; i++) {
+        float x, y, z;
+        if (!pose_f32(c, &x) || !pose_f32(c, &y) || !pose_f32(c, &z)) return 0;
+        if (i == 0) {
+            t[0] = x;
+            t[1] = y;
+            t[2] = z;
+        }
+    }
+    return 1;
+}
+
+static int pose_bit(const unsigned char* bits, int index) {
+    return (bits[index >> 3] >> (index & 7)) & 1;
+}
+
+static int pose_load(const void* xanim, size_t size, XanimPoseBone* dest, int cap, int* out_count) {
+    PoseCur c;
+    unsigned short ver = 0, frames = 0;
+    short part_count = 0;
+    unsigned char flags = 0;
+    unsigned short rate = 0;
+    unsigned total;
+    int looped, delta, small, i;
+    unsigned char sign[(XANIM_POSE_MAX + 7) / 8];
+    unsigned char comp[(XANIM_POSE_MAX + 7) / 8];
+    size_t bit_bytes;
+    if (!xanim || size < 8 || !dest || !out_count || cap <= 0) return 0;
+    c.p = (const unsigned char*)xanim;
+    c.n = size;
+    c.o = 0;
+    if (!pose_u16(&c, &ver) || ver != 14) return 0;
+    if (!pose_u16(&c, &frames)) return 0;
+    if (!pose_i16(&c, &part_count)) return 0;
+    if (!pose_u8(&c, &flags) || !pose_u16(&c, &rate)) return 0;
+    (void)rate;
+    if (part_count <= 0 || part_count > cap) return 0;
+    looped = (flags & 1) != 0;
+    delta = (flags & 2) != 0;
+    if (!looped && frames == 0) return 0;
+    total = (unsigned)frames + (looped ? 1u : 0u);
+    small = total <= 256u;
+    bit_bytes = ((size_t)part_count + 7u) / 8u;
+    if (delta) {
+        float q[4], t[3];
+        if (!pose_rotation(&c, 0, 0, total, small, q)) return 0;
+        if (!pose_translation(&c, total, small, t)) return 0;
+    }
+    if (!pose_skip(&c, bit_bytes) || !pose_skip(&c, bit_bytes)) return 0;
+    memcpy(sign, c.p + c.o - bit_bytes * 2, bit_bytes);
+    memcpy(comp, c.p + c.o - bit_bytes, bit_bytes);
+    for (i = 0; i < (int)part_count; i++) {
+        if (!pose_name(&c, dest[i].name, sizeof(dest[i].name))) return 0;
+    }
+    for (i = 0; i < (int)part_count; i++) {
+        if (!pose_rotation(&c, pose_bit(comp, i), pose_bit(sign, i), total, small, dest[i].q))
+            return 0;
+        if (!pose_translation(&c, total, small, dest[i].t)) return 0;
+    }
+    *out_count = (int)part_count;
+    return 1;
+}
+
+int cod_xmodel_set_anim_pose(const void* xanim, size_t size) {
+    int n = 0;
+    g_pose_count = 0;
+    if (!xanim || size < 8) return 0;
+    if (!pose_load(xanim, size, g_pose, XANIM_POSE_MAX, &n)) return 0;
+    g_pose_count = n;
+    return 1;
+}
+
+int cod_xmodel_overlay_anim_pose(const void* xanim, size_t size) {
+    XanimPoseBone extra[XANIM_POSE_MAX];
+    int n = 0;
+    int i, p;
+    if (!pose_load(xanim, size, extra, XANIM_POSE_MAX, &n)) return 0;
+    for (i = 0; i < n; i++) {
+        for (p = 0; p < g_pose_count; p++) {
+            if (strcmp(g_pose[p].name, extra[i].name) == 0) break;
+        }
+        if (p == g_pose_count) {
+            if (g_pose_count >= XANIM_POSE_MAX) return 0;
+            g_pose[g_pose_count++] = extra[i];
+        } else {
+            g_pose[p] = extra[i];
+        }
+    }
+    return 1;
+}
+
+static void apply_anim_pose(const unsigned char* parts, size_t parts_size, CoD1Bone* locals,
+                            int total, int child_count) {
+    size_t off;
+    int i;
+    if (g_pose_count <= 0 || !parts || !locals) return;
+    off = 6 + (size_t)child_count * 19;
+    for (i = 0; i < total; i++) {
+        size_t end = off;
+        char name[64];
+        size_t nlen;
+        int p;
+        if (off >= parts_size) return;
+        while (end < parts_size && parts[end] != 0) end++;
+        if (end >= parts_size) return;
+        nlen = end - off;
+        if (nlen >= sizeof(name)) nlen = sizeof(name) - 1;
+        memcpy(name, parts + off, nlen);
+        name[nlen] = 0;
+        if (end + 1 + 24 > parts_size) return;
+        off = end + 1 + 24;
+        for (p = 0; p < g_pose_count; p++) {
+            if (strcmp(g_pose[p].name, name) != 0) continue;
+            locals[i].q[0] = g_pose[p].q[0];
+            locals[i].q[1] = g_pose[p].q[1];
+            locals[i].q[2] = g_pose[p].q[2];
+            locals[i].q[3] = g_pose[p].q[3];
+            locals[i].trans[0] = g_pose[p].t[0];
+            locals[i].trans[1] = g_pose[p].t[1];
+            locals[i].trans[2] = g_pose[p].t[2];
+            break;
+        }
+    }
+}
+
 static int cod_xmodel_load_bones(const unsigned char* parts, size_t parts_size, CoD1Bone** out_locals,
                                  CoD1Bone** out_worlds, unsigned short* out_num_bones) {
     size_t p_off = 0;
-    unsigned short p_ver = 0, p_num_bones = 0, p_unk = 0;
+    unsigned short p_ver = 0, child_count = 0, root_count = 0;
+    int total;
     CoD1Bone* locals = NULL;
     CoD1Bone* worlds = NULL;
-    unsigned short bi;
+    int bi;
 
     *out_locals = NULL;
     *out_worlds = NULL;
     *out_num_bones = 0;
     if (!parts || parts_size < 6) return 0;
-    if (!ru16(parts, parts_size, &p_off, &p_ver) || !ru16(parts, parts_size, &p_off, &p_num_bones) ||
-        !ru16(parts, parts_size, &p_off, &p_unk))
+    if (!ru16(parts, parts_size, &p_off, &p_ver) || !ru16(parts, parts_size, &p_off, &child_count) ||
+        !ru16(parts, parts_size, &p_off, &root_count))
         return 0;
-    (void)p_unk;
-    if (p_ver != 14 || p_num_bones == 0 || p_num_bones > 256) return 0;
-    locals = (CoD1Bone*)calloc(p_num_bones, sizeof(CoD1Bone));
-    worlds = (CoD1Bone*)calloc(p_num_bones, sizeof(CoD1Bone));
+    total = (int)child_count + (int)root_count;
+    if (p_ver != 14 || total <= 0 || total > 256) return 0;
+    if ((size_t)child_count > (parts_size - 6) / 19) return 0;
+    locals = (CoD1Bone*)calloc((size_t)total, sizeof(CoD1Bone));
+    worlds = (CoD1Bone*)calloc((size_t)total, sizeof(CoD1Bone));
     if (!locals || !worlds) {
         free(locals);
         free(worlds);
         return 0;
     }
-    for (bi = 0; bi < p_num_bones; bi++) {
-        if (!read_cod1_bone_local(parts, parts_size, (int)bi, &locals[bi])) {
+    for (bi = 0; bi < (int)root_count; bi++) {
+        bone_identity(&locals[bi]);
+        locals[bi].parent = -1;
+    }
+    for (bi = 0; bi < (int)child_count; bi++) {
+        int bone_index = (int)root_count + bi;
+        if (!read_child_bone(parts, parts_size, 6 + (size_t)bi * 19, bone_index, total, &locals[bone_index])) {
             free(locals);
             free(worlds);
             return 0;
         }
     }
-    bake_bone_worlds(locals, worlds, (int)p_num_bones);
+    apply_anim_pose(parts, parts_size, locals, total, (int)child_count);
+    bake_bone_worlds(locals, worlds, total);
     *out_locals = locals;
     *out_worlds = worlds;
-    *out_num_bones = p_num_bones;
+    *out_num_bones = (unsigned short)total;
     return 1;
 }
 
@@ -436,6 +771,94 @@ int cod_xmodel_world_translations(const void* parts, size_t size, float* out_xyz
     free(locals);
     free(worlds);
     return (int)num_bones;
+}
+
+int cod_view_basis_rigid(const float cod_axes[9], const float cod_trans[3], float out[12]) {
+    const float* cx;
+    const float* cy;
+    const float* cz;
+    if (!cod_axes || !cod_trans || !out) return 0;
+    cx = cod_axes;
+    cy = cod_axes + 3;
+    cz = cod_axes + 6;
+    /* P(x,y,z)=(-y, z, x). The view weapon is drawn with AnglesToAxisNegRight,
+     * so model +Y lies along -right. Columns are P(-Y), P(Z), P(X). */
+    out[0] = cy[1]; out[1] = -cy[2]; out[2] = -cy[0];
+    out[3] = -cz[1]; out[4] = cz[2]; out[5] = cz[0];
+    out[6] = -cx[1]; out[7] = cx[2]; out[8] = cx[0];
+    out[9] = -cod_trans[1];
+    out[10] = cod_trans[2];
+    out[11] = cod_trans[0];
+    return 1;
+}
+
+int cod_xmodel_view_tag(const void* parts, size_t size, const char* name, float out[12]) {
+    const unsigned char* p = (const unsigned char*)parts;
+    CoD1Bone* locals = NULL;
+    CoD1Bone* worlds = NULL;
+    unsigned short num_bones = 0;
+    unsigned short ver = 0, child_count = 0, root_count = 0;
+    size_t off = 0;
+    int i, found = -1;
+    float axes[9];
+    float ex[3] = {1.f, 0.f, 0.f};
+    float ey[3] = {0.f, 1.f, 0.f};
+    float ez[3] = {0.f, 0.f, 1.f};
+    float rx[3], ry[3], rz[3];
+    if (!p || !name || !name[0] || !out) return 0;
+    if (!cod_xmodel_load_bones(p, size, &locals, &worlds, &num_bones)) return 0;
+    if (!ru16(p, size, &off, &ver) || !ru16(p, size, &off, &child_count) ||
+        !ru16(p, size, &off, &root_count)) {
+        free(locals);
+        free(worlds);
+        return 0;
+    }
+    off = 6 + (size_t)child_count * 19;
+    for (i = 0; i < (int)num_bones; i++) {
+        char bone[64];
+        size_t n = 0;
+        if (off >= size) break;
+        while (off < size && p[off] != 0 && n + 1 < sizeof(bone)) bone[n++] = (char)p[off++];
+        bone[n] = '\0';
+        if (off >= size || p[off] != 0) break;
+        off++;
+        if (off + 24 > size) break;
+        off += 24;
+        if (strcmp(bone, name) == 0) found = i;
+    }
+    if (found < 0) {
+        free(locals);
+        free(worlds);
+        return 0;
+    }
+    quat_rot(worlds[found].q, ex, rx);
+    quat_rot(worlds[found].q, ey, ry);
+    quat_rot(worlds[found].q, ez, rz);
+    axes[0] = rx[0]; axes[1] = rx[1]; axes[2] = rx[2];
+    axes[3] = ry[0]; axes[4] = ry[1]; axes[5] = ry[2];
+    axes[6] = rz[0]; axes[7] = rz[1]; axes[8] = rz[2];
+    cod_view_basis_rigid(axes, worlds[found].trans, out);
+    free(locals);
+    free(worlds);
+    return 1;
+}
+
+int cod_viewhand_text(const float tag[12], unsigned char** out_buf, unsigned int* out_size) {
+    char line[256];
+    int n;
+    if (!tag || !out_buf || !out_size) return 0;
+    n = snprintf(line, sizeof(line),
+                 "hands xmodel/viewmodel_hands_whermact\n"
+                 "gun xmodel/viewmodel_mp44\n"
+                 "tag %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n",
+                 tag[0], tag[1], tag[2], tag[3], tag[4], tag[5],
+                 tag[6], tag[7], tag[8], tag[9], tag[10], tag[11]);
+    if (n <= 0 || n >= (int)sizeof(line)) return 0;
+    *out_buf = (unsigned char*)malloc((size_t)n + 1);
+    if (!*out_buf) return 0;
+    memcpy(*out_buf, line, (size_t)n + 1);
+    *out_size = (unsigned)n;
+    return 1;
 }
 
 /* Retail CoD1 surfs. Rigid verts are R * position + T from one baked world bone. */
@@ -468,6 +891,8 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
         unsigned short num_verts = 0, num_tris = 0, pad = 0, bone = 0;
         unsigned short* tris = NULL;
         unsigned short* wcs = NULL;
+        unsigned short* pbones = NULL;
+        float* pweights = NULL;
         int ntri = 0;
         int stored = 0;
         int rigged;
@@ -488,7 +913,7 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
             if (!need(off, 4, size)) { free(bones); return wrote ? 1 : 0; }
             off += 4;
         } else if (bones) {
-            int bi = g_bone_rule.one_based ? (int)bone - 1 : (int)bone;
+            int bi = (int)bone;
             if (bi >= 0 && bi < (int)p_num_bones) {
                 tx = bones[bi].trans[0];
                 ty = bones[bi].trans[1];
@@ -499,9 +924,13 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
 
         tris = (unsigned short*)malloc((size_t)num_tris * 3 * sizeof(unsigned short));
         wcs = (unsigned short*)calloc(num_verts, sizeof(unsigned short));
-        if (!tris || !wcs) {
+        pbones = (unsigned short*)calloc(num_verts, sizeof(unsigned short));
+        pweights = (float*)malloc((size_t)num_verts * sizeof(float));
+        if (!tris || !wcs || !pbones || !pweights) {
             free(tris);
             free(wcs);
+            free(pbones);
+            free(pweights);
             free(bones);
             return wrote ? 1 : 0;
         }
@@ -587,6 +1016,8 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
         if (!ok || stored != (int)num_tris) {
             free(tris);
             free(wcs);
+            free(pbones);
+            free(pweights);
             free(bones);
             return wrote ? 1 : 0;
         }
@@ -601,6 +1032,8 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
                 free(uvs);
                 free(tris);
                 free(wcs);
+                free(pbones);
+                free(pweights);
                 free(bones);
                 return wrote ? 1 : 0;
             }
@@ -613,46 +1046,57 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
                 if (ok && rigged) {
                     if (!ru16(p, size, &off, &wc) || !ru16(p, size, &off, &vb)) ok = 0;
                     if (wc > 16) ok = 0;
-                    (void)vb;
                     wcs[v] = wc;
+                    pbones[v] = vb;
                 }
                 if (!ok || !rf32(p, size, &off, &xyz[v * 3]) || !rf32(p, size, &off, &xyz[v * 3 + 1]) ||
                     !rf32(p, size, &off, &xyz[v * 3 + 2]))
                     ok = 0;
                 if (ok && rigged && wc) {
-                    if (!need(off, 4, size)) ok = 0;
-                    else off += 4;
+                    if (!rf32(p, size, &off, &pweights[v])) ok = 0;
+                } else if (ok && rigged) {
+                    pweights[v] = 1.f;
                 }
             }
             if (ok && rigged) {
                 for (v = 0; ok && v < num_verts; v++) {
                     unsigned short w;
-                    float acc[3], ws;
-                    acc[0] = acc[1] = acc[2] = 0.f;
-                    ws = 0.f;
+                    float local[3], placed[3], nlocal[3], nout[3];
+                    float scale;
+                    int bi = (int)pbones[v];
+                    local[0] = xyz[v * 3];
+                    local[1] = xyz[v * 3 + 1];
+                    local[2] = xyz[v * 3 + 2];
+                    bone_point(bones, p_num_bones, bi, local, placed);
+                    scale = wcs[v] ? pweights[v] : 1.f;
+                    xyz[v * 3] = placed[0] * scale;
+                    xyz[v * 3 + 1] = placed[1] * scale;
+                    xyz[v * 3 + 2] = placed[2] * scale;
+                    nlocal[0] = nrm[v * 3];
+                    nlocal[1] = nrm[v * 3 + 1];
+                    nlocal[2] = nrm[v * 3 + 2];
+                    if (bones && bi >= 0 && bi < (int)p_num_bones) quat_rot(bones[bi].q, nlocal, nout);
+                    else {
+                        nout[0] = nlocal[0];
+                        nout[1] = nlocal[1];
+                        nout[2] = nlocal[2];
+                    }
+                    nrm[v * 3] = nout[0];
+                    nrm[v * 3 + 1] = nout[1];
+                    nrm[v * 3 + 2] = nout[2];
                     for (w = 0; ok && w < wcs[v]; w++) {
                         unsigned short bone_i = 0;
                         float wt = 0.f, o[3], bp[3];
-                        int bi;
-                        if (!ru16(p, size, &off, &bone_i) || !rf32(p, size, &off, &wt) ||
-                            !rf32(p, size, &off, &o[0]) || !rf32(p, size, &off, &o[1]) ||
-                            !rf32(p, size, &off, &o[2])) {
+                        if (!ru16(p, size, &off, &bone_i) || !rf32(p, size, &off, &o[0]) ||
+                            !rf32(p, size, &off, &o[1]) || !rf32(p, size, &off, &o[2]) ||
+                            !rf32(p, size, &off, &wt)) {
                             ok = 0;
                             break;
                         }
-                        bi = (int)bone_i;
-                        if (bones && bi >= 0 && bi < (int)p_num_bones && wt > 0.f) {
-                            quat_rot(bones[bi].q, o, bp);
-                            acc[0] += (bp[0] + bones[bi].trans[0]) * wt;
-                            acc[1] += (bp[1] + bones[bi].trans[1]) * wt;
-                            acc[2] += (bp[2] + bones[bi].trans[2]) * wt;
-                            ws += wt;
-                        }
-                    }
-                    if (ok && ws > 0.f) {
-                        xyz[v * 3] = acc[0] / ws;
-                        xyz[v * 3 + 1] = acc[1] / ws;
-                        xyz[v * 3 + 2] = acc[2] / ws;
+                        bone_point(bones, p_num_bones, (int)bone_i, o, bp);
+                        xyz[v * 3] += bp[0] * wt;
+                        xyz[v * 3 + 1] += bp[1] * wt;
+                        xyz[v * 3 + 2] += bp[2] * wt;
                     }
                 }
             }
@@ -693,6 +1137,8 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
         if (!ok) {
             free(tris);
             free(wcs);
+            free(pbones);
+            free(pweights);
             free(bones);
             return wrote ? 1 : 0;
         }
@@ -706,6 +1152,8 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
                 if (!xsb_append_f(sb, "f %d/%d/%d %d/%d/%d %d/%d/%d\n", a, a, a, b, b, b, c, c, c)) {
                     free(tris);
                     free(wcs);
+                    free(pbones);
+                    free(pweights);
                     free(bones);
                     return wrote ? 1 : 0;
                 }
@@ -714,6 +1162,8 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
         vert_base += (int)num_verts;
         free(tris);
         free(wcs);
+        free(pbones);
+        free(pweights);
     }
     free(bones);
     return 1;
@@ -862,62 +1312,63 @@ static int flush_vert(Xsb* sb, int** map, int* map_n, int vert_index, int obj_in
     return vmap_put(map, map_n, vert_index, obj_index);
 }
 
-static int image_ext(const char* s, size_t n) {
-    if (n < 4) return 0;
-    return cod_strcasecmp(s + n - 4, ".dds") == 0 || cod_strcasecmp(s + n - 4, ".tga") == 0 ||
-           cod_strcasecmp(s + n - 4, ".jpg") == 0 || cod_strcasecmp(s + n - 4, ".png") == 0;
-}
-
-static int scan_image_cstrings(const unsigned char* p, size_t size, size_t* starts, size_t* lens, int max) {
-    size_t i = 0;
-    int n = 0;
-    while (i < size && n < max) {
-        if (p[i] >= 32 && p[i] < 127) {
-            size_t start = i;
-            while (i < size && p[i] >= 32 && p[i] < 127) i++;
-            if (i < size && p[i] == 0) {
-                size_t len = i - start;
-                if (image_ext((const char*)p + start, len)) {
-                    starts[n] = start;
-                    lens[n] = len;
-                    n++;
-                }
-            }
-        } else {
-            i++;
-            continue;
-        }
-        i++;
+static int skip_xmodel_collision(const unsigned char* p, size_t size, size_t* off) {
+    unsigned int nsurf = 0;
+    unsigned int s;
+    if (!ru32(p, size, off, &nsurf)) return 0;
+    for (s = 0; s < nsurf; s++) {
+        unsigned int ntri = 0;
+        size_t bytes;
+        if (!ru32(p, size, off, &ntri)) return 0;
+        if (ntri > 1000000u) return 0;
+        bytes = (size_t)ntri * 48u + 24u + 12u;
+        if (!need(*off, bytes, size)) return 0;
+        *off += bytes;
     }
-    return n;
+    return 1;
 }
 
 int cod_xmodel_skin_names(const void* xmodel, size_t size, char names[][160], int cap) {
     const unsigned char* p = (const unsigned char*)xmodel;
-    size_t starts[64];
-    size_t lens[64];
-    int n;
-    int run_start;
-    int out = 0;
-    int i;
+    size_t off = 0;
+    unsigned short ver = 0;
+    unsigned int model_files = 0;
+    int named[3];
+    int slot;
+    char scratch[160];
+    float dist = 0.f;
 
-    if (!names || cap <= 0) return 0;
-    n = scan_image_cstrings(p, size, starts, lens, 64);
-    if (n == 0) return 0;
-    run_start = n - 1;
-    for (i = n - 1; i > 0; i--) {
-        if (starts[i - 1] + lens[i - 1] + 1 == starts[i])
-            run_start = i - 1;
-        else
-            break;
+    if (!names || cap <= 0 || !xmodel) return 0;
+    if (!ru16(p, size, &off, &ver) || ver != 14) return 0;
+    if (!need(off, 24, size)) return 0;
+    off += 24;
+    for (slot = 0; slot < 3; slot++) {
+        named[slot] = 0;
+        if (!rf32(p, size, &off, &dist)) return 0;
+        if (!rcstr(p, size, &off, scratch, sizeof(scratch))) return 0;
+        if (scratch[0]) named[slot] = 1;
     }
-    for (i = run_start; i < n && out < cap; i++) {
-        if (lens[i] + 1 > 160) continue;
-        memcpy(names[out], p + starts[i], lens[i]);
-        names[out][lens[i]] = '\0';
-        out++;
+    if (!ru32(p, size, &off, &model_files)) return 0;
+    (void)model_files;
+    (void)dist;
+    if (!skip_xmodel_collision(p, size, &off)) return 0;
+    for (slot = 0; slot < 3; slot++) {
+        unsigned short count = 0;
+        unsigned short k;
+        int out = 0;
+        if (!named[slot]) continue;
+        if (!ru16(p, size, &off, &count)) return 0;
+        if (count > 256) return 0;
+        for (k = 0; k < count; k++) {
+            if (!rcstr(p, size, &off, scratch, sizeof(scratch))) return out;
+            if (out < cap) {
+                memcpy(names[out], scratch, strlen(scratch) + 1);
+                out++;
+            }
+        }
+        return out;
     }
-    return out;
+    return 0;
 }
 
 static void store_mat(const char* pick) {

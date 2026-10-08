@@ -12,6 +12,7 @@
 #include "archive/archive.h"
 #include "bsp/read.h"
 #include "bsp/names.h"
+#include "bsp/helix.h"
 #include "xmodel/read.h"
 #include "xmodel/helix.h"
 #include "xanim/read.h"
@@ -31,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include <zlib.h>
 
 #ifdef _WIN32
@@ -183,6 +185,256 @@ static void test_xmodel_v14_lod(void) {
     report("test_xmodel_v14_lod", before);
 }
 
+static void test_view_basis_rigid(void) {
+    int before = checkpoint();
+    float axes[9];
+    float trans[3];
+    float out[12];
+    float expect12[12] = {0.f, 0.f, 1.f, 0.f, 1.f, 0.f, -1.f, 0.f, 0.f, -2.f, 3.f, 1.f};
+    int i;
+    memset(axes, 0, sizeof(axes));
+    /* 90 degrees about CoD Z: (x, y) -> (-y, x). Columns are the images of X, Y, Z. */
+    axes[0] = 0.f; axes[1] = 1.f; axes[2] = 0.f;
+    axes[3] = -1.f; axes[4] = 0.f; axes[5] = 0.f;
+    axes[6] = 0.f; axes[7] = 0.f; axes[8] = 1.f;
+    trans[0] = 1.f; trans[1] = 2.f; trans[2] = 3.f;
+    expect(cod_view_basis_rigid(axes, trans, out) == 1, "basis returns 1");
+    for (i = 0; i < 12; i++) expect(out[i] == expect12[i], "basis component");
+    expect(cod_view_basis_rigid(NULL, trans, out) == 0, "null axes");
+    report("test_view_basis_rigid", before);
+}
+
+static void test_view_tag_from_parts(void) {
+    int before = checkpoint();
+    unsigned char blob[128];
+    float out[12];
+    size_t o = 0;
+    int i;
+    memset(blob, 0, sizeof(blob));
+    put_u16(blob + o, 14); o += 2;
+    put_u16(blob + o, 1); o += 2; /* one child */
+    put_u16(blob + o, 1); o += 2; /* one root */
+    blob[o++] = 0; /* parent is the root */
+    put_f32(blob + o, 4.f); o += 4;
+    put_f32(blob + o, 5.f); o += 4;
+    put_f32(blob + o, 6.f); o += 4;
+    o += 6; /* quat shorts stay 0 */
+    memcpy(blob + o, "tag_view", 8); o += 8;
+    blob[o++] = 0;
+    o += 24; /* ignored tail, zeros */
+    memcpy(blob + o, "tag_weapon", 10); o += 10;
+    blob[o++] = 0;
+    for (i = 0; i < 24; i++) blob[o++] = 0xab;
+    expect(cod_xmodel_view_tag(blob, o, "tag_weapon", out) == 1, "tag found");
+    expect(out[0] == 1.f && out[1] == 0.f && out[2] == 0.f, "x axis");
+    expect(out[3] == 0.f && out[4] == 1.f && out[5] == 0.f, "y axis");
+    expect(out[6] == 0.f && out[7] == 0.f && out[8] == 1.f, "z axis");
+    expect(out[9] == -5.f && out[10] == 6.f && out[11] == 4.f, "permuted translation");
+    expect(cod_xmodel_view_tag(blob, o, "tag_missing", out) == 0, "unknown tag");
+    report("test_view_tag_from_parts", before);
+}
+
+static void test_viewhand_text(void) {
+    int before = checkpoint();
+    float tag[12] = {1.f, 0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 5.f, 6.f, 4.f};
+    unsigned char* text = NULL;
+    unsigned sz = 0;
+    expect(cod_viewhand_text(tag, &text, &sz) == 1, "text");
+    expect(text && strstr((char*)text, "hands xmodel/viewmodel_hands_whermact\n") != NULL, "hands line");
+    expect(text && strstr((char*)text, "gun xmodel/viewmodel_mp44\n") != NULL, "gun line");
+    expect(text && strstr((char*)text, "tag 1 0 0 0 1 0 0 0 1 5 6 4\n") != NULL, "tag line");
+    free(text);
+    report("test_viewhand_text", before);
+}
+
+/* Idle frame 0 replaces the bind local. The parts child sits at the origin. */
+static void test_viewhand_idle_pose(void) {
+    int before = checkpoint();
+    unsigned char parts[128];
+    unsigned char anim[64];
+    float out[12];
+    size_t o = 0;
+    size_t parts_len;
+    int i;
+    memset(parts, 0, sizeof(parts));
+    put_u16(parts + o, 14); o += 2;
+    put_u16(parts + o, 1); o += 2;
+    put_u16(parts + o, 1); o += 2;
+    parts[o++] = 0;
+    o += 12; /* translation stays 0 */
+    o += 6;
+    memcpy(parts + o, "tag_view", 8); o += 8;
+    parts[o++] = 0;
+    o += 24;
+    memcpy(parts + o, "tag_weapon", 10); o += 10;
+    parts[o++] = 0;
+    o += 24;
+    parts_len = o;
+    expect(cod_xmodel_view_tag(parts, parts_len, "tag_weapon", out) == 1, "bind tag");
+    expect(out[9] == 0.f && out[10] == 0.f && out[11] == 0.f, "bind stays at the eye");
+
+    o = 0;
+    memset(anim, 0, sizeof(anim));
+    put_u16(anim + o, 14); o += 2;
+    put_u16(anim + o, 1); o += 2; /* one frame */
+    put_u16(anim + o, 1); o += 2; /* one part */
+    anim[o++] = 0;                /* not looped, no delta */
+    put_u16(anim + o, 30); o += 2;
+    anim[o++] = 0; /* sign bits */
+    anim[o++] = 0; /* full quaternion */
+    memcpy(anim + o, "tag_weapon", 10); o += 10;
+    anim[o++] = 0;
+    put_u16(anim + o, 1); o += 2; /* one rotation key, identity shorts */
+    o += 6;
+    put_u16(anim + o, 1); o += 2;
+    put_f32(anim + o, 4.f); o += 4;
+    put_f32(anim + o, 5.f); o += 4;
+    put_f32(anim + o, 6.f); o += 4;
+    expect(cod_xmodel_set_anim_pose(anim, o) == 1, "pose stored");
+    expect(cod_xmodel_view_tag(parts, parts_len, "tag_weapon", out) == 1, "posed tag");
+    for (i = 0; i < 9; i++) {
+        float ident = (i % 4 == 0) ? 1.f : 0.f;
+        expect(out[i] > ident - 1e-4f && out[i] < ident + 1e-4f, "posed axis");
+    }
+    expect(out[9] > -5.f - 1e-4f && out[9] < -5.f + 1e-4f, "posed -ty");
+    expect(out[10] > 6.f - 1e-4f && out[10] < 6.f + 1e-4f, "posed tz");
+    expect(out[11] > 4.f - 1e-4f && out[11] < 4.f + 1e-4f, "posed tx");
+    cod_xmodel_set_anim_pose(NULL, 0);
+    expect(cod_xmodel_view_tag(parts, parts_len, "tag_weapon", out) == 1, "cleared tag");
+    expect(out[9] == 0.f && out[10] == 0.f && out[11] == 0.f, "clear restores bind");
+    report("test_viewhand_idle_pose", before);
+}
+
+/* Retail bind bones all sit on the origin. Idle frame 0 moves the arms. */
+static void test_viewhand_idle_retail(void) {
+    int before = checkpoint();
+    const char* env = getenv("COD_MAIN");
+    const char* dir = (env && env[0]) ? env :
+        "C:/Program Files (x86)/Steam/steamapps/common/Call of Duty/Main";
+    DIR* opened = opendir(dir);
+    CodArchive* ar;
+    char pak[1024];
+    unsigned char* anim = NULL;
+    unsigned char* parts = NULL;
+    unsigned asz = 0, psz = 0;
+    float xyz[256 * 3];
+    int n, i;
+    float far = 0.f;
+    size_t dlen;
+    if (!opened) {
+        printf("test_viewhand_idle_retail: SKIP\n");
+        return;
+    }
+    closedir(opened);
+    ar = cod_archive_create();
+    dlen = strlen(dir);
+    if (dlen > 0 && (dir[dlen - 1] == '/' || dir[dlen - 1] == '\\'))
+        snprintf(pak, sizeof(pak), "%spak0.pk3", dir);
+    else
+        snprintf(pak, sizeof(pak), "%s/pak0.pk3", dir);
+    expect(ar && cod_archive_add_zip(ar, pak) == 1, "pak0");
+    expect(ar && cod_archive_read(ar, "xanim/viewmodel_mp44_idle", &anim, &asz) == 1, "idle clip");
+    expect(ar && cod_archive_read(ar, "xmodelparts/viewmodel_hands_new4", &parts, &psz) == 1, "hand parts");
+    expect(cod_xmodel_set_anim_pose(anim, asz) == 1, "retail pose");
+    free(anim);
+    anim = NULL;
+    asz = 0;
+    expect(ar && cod_archive_read(ar, "xanim/viewmodel_mp44_ADS_up", &anim, &asz) == 1, "ads up clip");
+    expect(cod_xmodel_overlay_anim_pose(anim, asz) == 1, "hip tag_torso");
+    n = cod_xmodel_world_translations(parts, psz, xyz, 256);
+    expect(n > 4, "bone count");
+    for (i = 0; i < n; i++) {
+        float ax = xyz[i * 3], ay = xyz[i * 3 + 1], az = xyz[i * 3 + 2];
+        float m = ax < 0 ? -ax : ax;
+        if (ay < 0 && -ay > m) m = -ay;
+        if (az < 0 && -az > m) m = -az;
+        if (ay > m) m = ay;
+        if (az > m) m = az;
+        if (m > far) far = m;
+    }
+    expect(far > 8.f, "an arm leaves the eye");
+    {
+        float tag[12];
+        expect(cod_xmodel_view_tag(parts, psz, "tag_weapon", tag) == 1, "hip tag");
+        /* ADS_up frame 0 pushes tag_torso to about (8.5, -3.3, -3.7). */
+        expect(tag[11] > 5.f, "hip tag is in front of the eye");
+        expect(tag[10] < -2.f, "hip tag is below the eye");
+    }
+    cod_xmodel_set_anim_pose(NULL, 0);
+    free(anim);
+    free(parts);
+    cod_archive_destroy(ar);
+    report("test_viewhand_idle_retail", before);
+}
+
+/* A second clip replaces its own bone and leaves the idle bone in place. */
+static void test_viewhand_pose_overlay(void) {
+    int before = checkpoint();
+    unsigned char idle[64];
+    unsigned char ads[64];
+    unsigned char parts[160];
+    float out[12];
+    size_t o = 0;
+    size_t parts_len;
+    memset(parts, 0, sizeof(parts));
+    put_u16(parts + o, 14); o += 2;
+    put_u16(parts + o, 1); o += 2;
+    put_u16(parts + o, 1); o += 2;
+    parts[o++] = 0;
+    o += 18;
+    memcpy(parts + o, "tag_view", 8); o += 8;
+    parts[o++] = 0;
+    o += 24;
+    memcpy(parts + o, "tag_weapon", 10); o += 10;
+    parts[o++] = 0;
+    o += 24;
+    parts_len = o;
+
+    o = 0;
+    memset(idle, 0, sizeof(idle));
+    put_u16(idle + o, 14); o += 2;
+    put_u16(idle + o, 1); o += 2;
+    put_u16(idle + o, 1); o += 2;
+    idle[o++] = 0;
+    put_u16(idle + o, 30); o += 2;
+    idle[o++] = 0;
+    idle[o++] = 0;
+    memcpy(idle + o, "tag_weapon", 10); o += 10;
+    idle[o++] = 0;
+    put_u16(idle + o, 1); o += 2;
+    o += 6;
+    put_u16(idle + o, 1); o += 2;
+    put_f32(idle + o, 4.f); o += 4;
+    put_f32(idle + o, 5.f); o += 4;
+    put_f32(idle + o, 6.f); o += 4;
+    expect(cod_xmodel_set_anim_pose(idle, o) == 1, "idle stored");
+
+    o = 0;
+    memset(ads, 0, sizeof(ads));
+    put_u16(ads + o, 14); o += 2;
+    put_u16(ads + o, 1); o += 2;
+    put_u16(ads + o, 1); o += 2;
+    ads[o++] = 0;
+    put_u16(ads + o, 30); o += 2;
+    ads[o++] = 0;
+    ads[o++] = 0;
+    memcpy(ads + o, "tag_torso", 9); o += 9;
+    ads[o++] = 0;
+    put_u16(ads + o, 0); o += 2;
+    put_u16(ads + o, 1); o += 2;
+    put_f32(ads + o, 8.f); o += 4;
+    put_f32(ads + o, 0.f); o += 4;
+    put_f32(ads + o, 0.f); o += 4;
+    expect(cod_xmodel_overlay_anim_pose(ads, o) == 1, "torso merged");
+    expect(cod_xmodel_view_tag(parts, parts_len, "tag_weapon", out) == 1, "weapon kept");
+    expect(out[11] > 4.f - 1e-4f && out[11] < 4.f + 1e-4f, "idle translation stays");
+    expect(cod_xmodel_overlay_anim_pose(NULL, 0) == 0, "empty overlay rejected");
+    expect(cod_xmodel_view_tag(parts, parts_len, "tag_weapon", out) == 1, "pose still there");
+    expect(out[11] > 4.f - 1e-4f && out[11] < 4.f + 1e-4f, "reject leaves the pose");
+    cod_xmodel_set_anim_pose(NULL, 0);
+    report("test_viewhand_pose_overlay", before);
+}
+
 static void test_xmodel_lod_slots(void) {
     int before = checkpoint();
     unsigned char header[128];
@@ -262,6 +514,38 @@ static void test_xmodel_first_lod(void) {
     report("test_xmodel_first_lod", before);
 }
 
+static size_t write_skin_xmodel(unsigned char* xm, size_t cap, const char** names, int count) {
+    size_t n = 0;
+    int i;
+    memset(xm, 0, cap);
+    put_u16(xm + n, 14);
+    n += 2 + 24;
+    put_f32(xm + n, 0.f);
+    n += 4;
+    if (n + 6 > cap) return 0;
+    memcpy(xm + n, "surf0", 6);
+    n += 6;
+    put_f32(xm + n, 0.f);
+    n += 4;
+    if (n >= cap) return 0;
+    xm[n++] = 0;
+    put_f32(xm + n, 0.f);
+    n += 4;
+    if (n >= cap) return 0;
+    xm[n++] = 0;
+    n += 8;
+    if (n + 2 > cap) return 0;
+    put_u16(xm + n, (unsigned short)count);
+    n += 2;
+    for (i = 0; i < count; i++) {
+        size_t len = strlen(names[i]) + 1;
+        if (n + len > cap) return 0;
+        memcpy(xm + n, names[i], len);
+        n += len;
+    }
+    return n;
+}
+
 static void test_xmodel_v14_surf(void) {
     int before = checkpoint();
     unsigned char xm[2];
@@ -292,17 +576,16 @@ static void test_xmodel_v14_surf(void) {
     expect(cod_gameplay_xmodel("models/player.obj") != NULL, "player body");
     expect(cod_gameplay_xmodel("models/pickup.obj") == NULL, "pickup stays stock");
     {
-        unsigned char skinxm[80];
-        const char* hand = "body@characterhand.dds";
-        const char* body = "viewmodel@bar_body.dds";
-        memset(skinxm, 0, sizeof(skinxm));
-        put_u16(skinxm, 14);
-        memcpy(skinxm + 2, hand, strlen(hand) + 1);
-        memcpy(skinxm + 3 + strlen(hand), body, strlen(body) + 1);
+        unsigned char skinxm[192];
+        const char* skins[2];
+        size_t skin_n;
+        skins[0] = "body@characterhand.dds";
+        skins[1] = "viewmodel@bar_body.dds";
+        skin_n = write_skin_xmodel(skinxm, sizeof(skinxm), skins, 2);
         free(obj);
         obj = NULL;
         sz = 0;
-        expect(cod_xmodel_to_obj(skinxm, sizeof(skinxm), surf, sizeof(surf), NULL, 0, &obj, &sz) == 1, "skin obj");
+        expect(cod_xmodel_to_obj(skinxm, skin_n, surf, sizeof(surf), NULL, 0, &obj, &sz) == 1, "skin obj");
         expect(obj && strstr((const char*)obj, "usemtl skins/body@characterhand.png\n") != NULL, "first file-order skin");
     }
     free(obj);
@@ -331,23 +614,21 @@ static void fill_one_tri(unsigned char* surf) {
 
 static void test_xmodel_skin_order(void) {
     int before = checkpoint();
-    unsigned char xm[128];
+    unsigned char xm[256];
     unsigned char surf[20 + 3 * 32];
     unsigned char* obj = NULL;
     unsigned int sz = 0;
     char names[4][160];
-    const char* a = "metal@ford.dds";
-    const char* b = "metal@fordhub.dds";
+    const char* pair[2];
+    const char* hands[2];
     size_t n;
     int count;
-    memset(xm, 0, sizeof(xm));
     fill_one_tri(surf);
-    put_u16(xm, 14);
-    n = 2;
-    memcpy(xm + n, a, strlen(a) + 1); n += strlen(a) + 1;
-    memcpy(xm + n, b, strlen(b) + 1); n += strlen(b) + 1;
+    pair[0] = "metal@ford.dds";
+    pair[1] = "metal@fordhub.dds";
+    n = write_skin_xmodel(xm, sizeof(xm), pair, 2);
     count = cod_xmodel_skin_names(xm, n, names, 4);
-    expect(count == 2, "two tail skins");
+    expect(count == 2, "two lod skins");
     expect(strcmp(names[0], "metal@ford.dds") == 0, "file order");
     expect(strcmp(names[1], "metal@fordhub.dds") == 0, "second skin kept");
     cod_xmodel_set_keep_hands(0);
@@ -361,11 +642,9 @@ static void test_xmodel_skin_order(void) {
     expect(obj && strstr((const char*)obj, "usemtl skins/unbound.png\n") != NULL, "unbound");
     free(obj);
     obj = NULL;
-    n = 2;
-    memcpy(xm + n, "body@characterhand.dds", strlen("body@characterhand.dds") + 1);
-    n += strlen("body@characterhand.dds") + 1;
-    memcpy(xm + n, "viewmodel@bar_body.dds", strlen("viewmodel@bar_body.dds") + 1);
-    n += strlen("viewmodel@bar_body.dds") + 1;
+    hands[0] = "body@characterhand.dds";
+    hands[1] = "viewmodel@bar_body.dds";
+    n = write_skin_xmodel(xm, sizeof(xm), hands, 2);
     cod_xmodel_set_keep_hands(1);
     expect(cod_xmodel_to_obj(xm, n, surf, sizeof(surf), NULL, 0, &obj, &sz) == 1, "viewmodel skins");
     expect(obj && strstr((const char*)obj, "usemtl skins/viewmodel@bar_body.png\n") != NULL, "hand sorted behind flag");
@@ -966,6 +1245,38 @@ static void test_texture_shader_menu(void) {
         free(text);
         text = NULL;
     }
+    {
+        const char* deck =
+            "textures/battleship/flagfore\n"
+            "{\n"
+            "  {\n"
+            "    map textures/battleship/whiteplanks.tga\n"
+            "  nextbundle\n"
+            "    map textures/battleship/deckflag_np.tga\n"
+            "    tcMod transform .25 0 0 .25 .375 .4375\n"
+            "  }\n"
+            "  {\n"
+            "    map $lightmap\n"
+            "    blendFunc filter\n"
+            "  }\n"
+            "  {\n"
+            "    perlight\n"
+            "    map textures/battleship/whiteplanks.tga\n"
+            "    blendFunc add\n"
+            "  nextbundle\n"
+            "    map textures/battleship/deckflag_np.tga\n"
+            "    tcMod transform .25 0 0 .25 .375 .4375\n"
+            "    blendFunc filter\n"
+            "  }\n"
+            "}\n";
+        text = NULL;
+        expect(shader_source_to_helix(deck, strlen(deck), &text, &sz) == 1, "deck flag shader");
+        expect(text && strstr((char*)text, "albedo_map textures/battleship/deckflag_np.png") != NULL, "deck flag image");
+        expect(text && strstr((char*)text, "uvTransform 0.25 0 0 0.25 0.375 0.4375") != NULL, "deck flag uv");
+        expect(text && strstr((char*)text, "blend additive") == NULL, "perlight add is not the base");
+        free(text);
+        text = NULL;
+    }
     a = cod_archive_create();
     expect(cod_archive_add_blob(a, "ui_mp/menus.txt", menus, (unsigned int)strlen(menus)) == 1, "menus blob");
     expect(cod_archive_add_blob(a, "ui_mp/good.menu", good, (unsigned int)strlen(good)) == 1, "good menu");
@@ -1315,6 +1626,28 @@ static void vm_weapon(void* user, const char* name) {
     (void)user;
     snprintf(g_vm_weapon, sizeof(g_vm_weapon), "%s", name ? name : "");
 }
+
+/* Sequence log for test_gsc_vm_thread only. vm_weapon stays last-name. */
+#define VM_WEAPON_SEQ 8
+static char g_vm_weapon_seq[VM_WEAPON_SEQ][64];
+static int g_vm_weapon_seq_n;
+
+static void vm_weapon_seq(void* user, const char* name) {
+    (void)user;
+    if (g_vm_weapon_seq_n < VM_WEAPON_SEQ) {
+        snprintf(g_vm_weapon_seq[g_vm_weapon_seq_n],
+                 sizeof(g_vm_weapon_seq[0]), "%s", name ? name : "");
+        g_vm_weapon_seq_n++;
+    }
+}
+
+static int weapon_seq_has(const char* name) {
+    int i;
+    for (i = 0; i < g_vm_weapon_seq_n; i++) {
+        if (strcmp(g_vm_weapon_seq[i], name) == 0) return 1;
+    }
+    return 0;
+}
 static void vm_gt(void* user, const char* name) {
     (void)user;
     snprintf(g_vm_gt, sizeof(g_vm_gt), "%s", name ? name : "");
@@ -1349,47 +1682,303 @@ static void test_gsc_vm(void) {
     report("test_gsc_vm", before);
 }
 
+static void test_gsc_vm_fib(void) {
+    int before = checkpoint();
+    const char* src =
+        "fib(n)\n"
+        "{\n"
+        "  if (n < 2)\n"
+        "    return n;\n"
+        "  return fib(n - 1) + fib(n - 2);\n"
+        "}\n"
+        "main()\n"
+        "{\n"
+        "  return fib(10);\n"
+        "}\n";
+    const char* wrap = "main()\n{\n  return 2147483648;\n}\n";
+    const char* divmin = "main()\n{\n  return -2147483648 / -1;\n}\n";
+    expect(gsc_vm_exec(src, strlen(src), "main", NULL) == 1, "fib runs");
+    expect(gsc_vm_last_int == 55, "fib 10");
+    expect(gsc_vm_exec(wrap, strlen(wrap), "main", NULL) == 1, "wrap runs");
+    expect(gsc_vm_last_int == (int)(-2147483647 - 1), "2147483648 wraps");
+    expect(gsc_vm_exec(divmin, strlen(divmin), "main", NULL) == 1, "divmin runs");
+    expect(gsc_vm_last_int == (int)(-2147483647 - 1), "INT_MIN divided by -1");
+    expect(gsc_vm_exec(src, strlen(src), "missing", NULL) == 0, "missing func");
+    report("test_gsc_vm_fib", before);
+}
+
+static void test_gsc_vm_array(void) {
+    int before = checkpoint();
+    const char* src =
+        "main()\n"
+        "{\n"
+        "  a = [];\n"
+        "  for (i = 0; i < 5; i++)\n"
+        "    a[i] = i * i;\n"
+        "  total = 0;\n"
+        "  for (j = 0; j < a.size; j++)\n"
+        "    total += a[j];\n"
+        "  s = spawnstruct();\n"
+        "  s.total = total;\n"
+        "  return s.total;\n"
+        "}\n";
+    const char* hang =
+        "main()\n"
+        "{\n"
+        "  while (1)\n"
+        "    i = 1;\n"
+        "}\n";
+    expect(gsc_vm_exec(src, strlen(src), "main", NULL) == 1, "array runs");
+    expect(gsc_vm_last_int == 30, "sum of squares");
+    const char* sw =
+        "main()\n"
+        "{\n"
+        "  n = 1;\n"
+        "  switch (n)\n"
+        "  {\n"
+        "  case 1:\n"
+        "    n = n + 10;\n"
+        "  case 2:\n"
+        "    n = n + 100;\n"
+        "    break;\n"
+        "  default:\n"
+        "    n = 0;\n"
+        "  }\n"
+        "  return n;\n"
+        "}\n";
+    expect(gsc_vm_exec(hang, strlen(hang), "main", NULL) == 0, "fuel stops the loop");
+    expect(gsc_vm_exec(sw, strlen(sw), "main", NULL) == 1, "switch runs");
+    expect(gsc_vm_last_int == 111, "switch falls through");
+    const char* named =
+        "main()\n"
+        "{\n"
+        "  n = 1;\n"
+        "  switch (n)\n"
+        "  {\n"
+        "  showcase = 1;\n"
+        "  case 1:\n"
+        "    n = n + 10;\n"
+        "  case 2:\n"
+        "    n = n + 100;\n"
+        "    break;\n"
+        "  default:\n"
+        "    n = 0;\n"
+        "  }\n"
+        "  return n;\n"
+        "}\n";
+    const char* huge =
+        "main()\n"
+        "{\n"
+        "  a = [];\n"
+        "  a[100000000] = 1;\n"
+        "  return 7;\n"
+        "}\n";
+    expect(gsc_vm_exec(named, strlen(named), "main", NULL) == 1, "showcase switch runs");
+    expect(gsc_vm_last_int == 111, "showcase is not a case");
+    expect(gsc_vm_exec(huge, strlen(huge), "main", NULL) == 1, "huge index runs");
+    expect(gsc_vm_last_int == 7, "huge index is a no-op");
+    report("test_gsc_vm_array", before);
+}
+
+static char g_far_text[] =
+    "note()\n"
+    "{\n"
+    "  x = \"sentinel\";\n"
+    "}\n"
+    "stock()\n"
+    "{\n"
+    "  giveWeapon(\"mp44_mp\");\n"
+    "}\n"
+    "ret()\n"
+    "{\n"
+    "  return 44;\n"
+    "}\n"
+    "ret2()\n"
+    "{\n"
+    "  a = [];\n"
+    "  a[0] = 7;\n"
+    "  return a;\n"
+    "}\n"
+    "take(a)\n"
+    "{\n"
+    "  giveWeapon(a[0]);\n"
+    "}\n";
+
+static int far_read(void* user, const char* path, char** text, size_t* size) {
+    (void)user;
+    if (!path || strcmp(path, "maps/mp/_load.gsc") != 0) return 0;
+    *size = strlen(g_far_text);
+    *text = (char*)malloc(*size + 1);
+    if (!*text) return 0;
+    memcpy(*text, g_far_text, *size + 1);
+    return 1;
+}
+
+static void test_gsc_vm_far(void) {
+    int before = checkpoint();
+    const char* src =
+        "main()\n"
+        "{\n"
+        "  maps\\mp\\_load::stock();\n"
+        "}\n";
+    GscHost host;
+    memset(&host, 0, sizeof(host));
+    host.read_file = far_read;
+    host.give_weapon = vm_weapon;
+    g_vm_weapon[0] = '\0';
+    expect(gsc_vm_exec(src, strlen(src), "main", &host) == 1, "far runs");
+    expect(strcmp(g_vm_weapon, "mp44_mp") == 0, "far weapon");
+    {
+        const char* iret =
+            "main()\n"
+            "{\n"
+            "  return maps\\mp\\_load::ret();\n"
+            "}\n";
+        const char* aret =
+            "main()\n"
+            "{\n"
+            "  return maps\\mp\\_load::ret2()[0];\n"
+            "}\n";
+        expect(gsc_vm_exec(iret, strlen(iret), "main", &host) == 1, "far int runs");
+        expect(gsc_vm_last_int == 44, "far int return");
+        expect(gsc_vm_exec(aret, strlen(aret), "main", &host) == 1, "far array runs");
+        expect(gsc_vm_last_int == 7, "far array element");
+    }
+    {
+        const char* div =
+            "main()\n"
+            "{\n"
+            "  a = 8;\n"
+            "  return a / 2;\n"
+            "}\n";
+        const char* take =
+            "main()\n"
+            "{\n"
+            "  a = [];\n"
+            "  a[0] = \"mp44_mp\";\n"
+            "  maps\\mp\\_load::take(a);\n"
+            "}\n";
+        expect(gsc_vm_exec(div, strlen(div), "main", NULL) == 1, "div runs");
+        expect(gsc_vm_last_int == 4, "a / 2");
+        g_vm_weapon[0] = '\0';
+        expect(gsc_vm_exec(take, strlen(take), "main", &host) == 1, "far arg runs");
+        expect(strcmp(g_vm_weapon, "mp44_mp") == 0, "far array arg");
+    }
+    report("test_gsc_vm_far", before);
+}
+
+static void test_gsc_vm_thread(void) {
+    int before = checkpoint();
+    const char* src =
+        "load()\n"
+        "{\n"
+        "  giveWeapon(\"kar98k_mp\");\n"
+        "  wait 1;\n"
+        "  giveWeapon(\"mp40_mp\");\n"
+        "}\n"
+        "main()\n"
+        "{\n"
+        "  thread load();\n"
+        "  giveWeapon(\"m1garand_mp\");\n"
+        "  getent(\"door\", \"targetname\");\n"
+        "  giveWeapon(\"colt_mp\");\n"
+        "}\n";
+    GscHost host;
+    memset(&host, 0, sizeof(host));
+    host.give_weapon = vm_weapon_seq;
+    g_vm_weapon_seq_n = 0;
+    expect(gsc_vm_exec(src, strlen(src), "main", &host) == 1, "thread runs");
+    expect(g_vm_weapon_seq_n == 2, "thread then caller");
+    expect(g_vm_weapon_seq_n >= 1 &&
+           strcmp(g_vm_weapon_seq[0], "kar98k_mp") == 0, "thread weapon first");
+    expect(g_vm_weapon_seq_n >= 2 &&
+           strcmp(g_vm_weapon_seq[1], "m1garand_mp") == 0, "caller weapon second");
+    expect(!weapon_seq_has("mp40_mp"), "no weapon after wait");
+    expect(!weapon_seq_has("colt_mp"), "no weapon after getent");
+    report("test_gsc_vm_thread", before);
+}
+
+static void test_gsc_vm_cullfog(void) {
+    int before = checkpoint();
+    const char* src =
+        "main()\n"
+        "{\n"
+        "  setCullFog(300, 3500, .32, 0, 0, 0);\n"
+        "  ambientPlay(\"after_fog\");\n"
+        "}\n";
+    GscHost host;
+    memset(&host, 0, sizeof(host));
+    host.ambient = vm_ambient;
+    g_vm_ambient[0] = '\0';
+    expect(gsc_vm_exec(src, strlen(src), "main", &host) == 1, "fog exec");
+    expect(strcmp(g_vm_ambient, "after_fog") == 0, "ambient after fog");
+    report("test_gsc_vm_cullfog", before);
+}
+
+static void test_gsc_vm_funcref(void) {
+    int before = checkpoint();
+    const char* src =
+        "main()\n"
+        "{\n"
+        "  level.callback = ::Callback_StartGameType;\n"
+        "  ambientPlay(\"after_ref\");\n"
+        "}\n";
+    GscHost host;
+    memset(&host, 0, sizeof(host));
+    host.ambient = vm_ambient;
+    g_vm_ambient[0] = '\0';
+    expect(gsc_vm_exec(src, strlen(src), "main", &host) == 1, "ref exec");
+    expect(strcmp(g_vm_ambient, "after_ref") == 0, "ambient after ref");
+    report("test_gsc_vm_funcref", before);
+}
+
+static void test_gsc_vm_float(void) {
+    int before = checkpoint();
+    const char* src =
+        "main()\n"
+        "{\n"
+        "  x = 0.5;\n"
+        "  if (x > 0) return 3;\n"
+        "  return 4;\n"
+        "}\n";
+    expect(gsc_vm_exec(src, strlen(src), "main", NULL) == 1, "float exec");
+    expect(gsc_vm_last_int == 3, "0.5 > 0 returns 3");
+    report("test_gsc_vm_float", before);
+}
+
 static void test_xmodel_bone_once(void) {
     int before = checkpoint();
     unsigned char parts[6 + 19 * 2];
-    float xyz[6];
-    CodXmodelBoneRule rule;
+    float xyz[9];
     int n;
     memset(parts, 0, sizeof(parts));
     put_u16(parts + 0, 14);
     put_u16(parts + 2, 2);
     put_u16(parts + 4, 1);
-    /* bone 0 parent = 1 (higher index), translation (1,0,0), quat 0 */
-    parts[6] = 1;
-    put_f32(parts + 7, 1.f);
-    /* bone 1 parent = 255, translation (0,0,10) */
+    /* bone 1, child of root 0, translation (0,0,10) */
+    parts[6] = 0;
+    put_f32(parts + 6 + 9, 10.f);
+    /* bone 2, child of bone 1, translation (1,0,0) */
+    parts[6 + 19] = 1;
+    put_f32(parts + 6 + 19 + 1, 1.f);
+    n = cod_xmodel_world_translations(parts, sizeof(parts), xyz, 3);
+    expect(n == 3, "root plus two children");
+    expect(xyz[0] == 0.f && xyz[1] == 0.f && xyz[2] == 0.f, "root stays at origin");
+    expect(xyz[3] == 0.f && xyz[4] == 0.f && xyz[5] == 10.f, "first child");
+    expect(xyz[6] == 1.f && xyz[7] == 0.f && xyz[8] == 10.f, "child adds parent once");
+    /* A parent index at or past the bone is not a link. That bone stays identity. */
     parts[6 + 19] = 255;
-    put_f32(parts + 6 + 19 + 1 + 8, 10.f);
-    rule.one_based = 1;
-    rule.parent0_is_root = 0;
-    cod_xmodel_set_bone_rule(rule);
-    n = cod_xmodel_world_translations(parts, sizeof(parts), xyz, 2);
-    expect(n == 2, "two bones");
-    expect(xyz[3] == 0.f && xyz[4] == 0.f && xyz[5] == 10.f, "root stays");
-    expect(xyz[0] == 1.f && xyz[1] == 0.f && xyz[2] == 10.f, "child adds parent once");
-    /* Cycle: each parent points at the other. Both worlds are identity. */
-    parts[6] = 1;
-    parts[6 + 19] = 0;
-    n = cod_xmodel_world_translations(parts, sizeof(parts), xyz, 2);
-    expect(n == 2, "cycle count");
-    expect(xyz[0] == 0.f && xyz[1] == 0.f && xyz[2] == 0.f, "cycle bone 0 identity");
-    expect(xyz[3] == 0.f && xyz[4] == 0.f && xyz[5] == 0.f, "cycle bone 1 identity");
-    /* Quat shorts outside the unit sphere: w becomes 0 and the child translation stays finite. */
-    parts[6] = 1;
-    parts[6 + 19] = 255;
+    n = cod_xmodel_world_translations(parts, sizeof(parts), xyz, 3);
+    expect(n == 3, "bad parent count");
+    expect(xyz[6] == 0.f && xyz[7] == 0.f && xyz[8] == 0.f, "bad parent is identity");
+    parts[6 + 19] = 1;
     put_u16(parts + 6 + 19 + 13, 32767);
     put_u16(parts + 6 + 19 + 15, 32767);
     put_u16(parts + 6 + 19 + 17, 32767);
-    put_f32(parts + 7, 1.f);
-    put_f32(parts + 6 + 19 + 1 + 8, 0.f);
-    n = cod_xmodel_world_translations(parts, sizeof(parts), xyz, 2);
-    expect(n == 2, "oversize quat count");
-    expect(xyz[0] > -100.f && xyz[0] < 100.f, "oversize quat stays finite");
+    put_f32(parts + 6 + 19 + 1, 1.f);
+    n = cod_xmodel_world_translations(parts, sizeof(parts), xyz, 3);
+    expect(n == 3, "oversize quat count");
+    expect(xyz[6] > -100.f && xyz[6] < 100.f, "oversize quat stays finite");
     report("test_xmodel_bone_once", before);
 }
 
@@ -1401,20 +1990,17 @@ static void test_xmodel_bind_apply(void) {
     unsigned char* obj = NULL;
     unsigned int sz = 0;
     CodXmodelBoneRule saved;
-    CodXmodelBoneRule rule;
     size_t i;
 
     saved = cod_xmodel_bone_rule();
     memset(parts, 0, sizeof(parts));
     put_u16(parts + 0, 14);
     put_u16(parts + 2, 1);
-    parts[6] = 255;
+    put_u16(parts + 4, 1);
+    parts[6] = 0;
     put_f32(parts + 7, 4.f);
     put_f32(parts + 11, 5.f);
     put_f32(parts + 15, 6.f);
-    rule.one_based = 1;
-    rule.parent0_is_root = 0;
-    cod_xmodel_set_bone_rule(rule);
     cod_xmodel_set_keep_hands(0);
     put_u16(xm, 14);
 
@@ -1448,14 +2034,16 @@ static void test_xmodel_bind_apply(void) {
     }
 
     {
-        /* A triangle needs three distinct indices. Vertex 0 carries the one weight. */
+        /* Skinned triangle. Bone 1 is at (0,0,5). A single influence uses the
+         * primary bone even when the additive count is zero. */
         unsigned char rig[256];
         size_t o = 0;
         unsigned v;
         memset(parts, 0, sizeof(parts));
         put_u16(parts + 0, 14);
         put_u16(parts + 2, 1);
-        parts[6] = 255;
+        put_u16(parts + 4, 1);
+        parts[6] = 0;
         put_f32(parts + 15, 5.f);
         memset(rig, 0, sizeof(rig));
         put_u16(rig + o, 14); o += 2;
@@ -1472,25 +2060,54 @@ static void test_xmodel_bind_apply(void) {
         put_u16(rig + o, 2); o += 2;
         for (v = 0; v < 3; v++) {
             o += 12 + 8;
-            put_u16(rig + o, v == 0 ? 1 : 0); o += 2;
             put_u16(rig + o, 0); o += 2;
+            put_u16(rig + o, 1); o += 2;
             if (v == 0) {
-                put_f32(rig + o, 9.f); o += 4;
-                put_f32(rig + o, 9.f); o += 4;
-                put_f32(rig + o, 9.f); o += 4;
-                o += 4;
-            } else {
-                put_f32(rig + o, (float)(v + 2)); o += 4;
+                put_f32(rig + o, 1.f); o += 4;
                 o += 8;
+            } else {
+                o += 12;
             }
         }
-        put_u16(rig + o, 0); o += 2;
-        put_f32(rig + o, 1.f); o += 4;
-        put_f32(rig + o, 1.f); o += 4;
-        o += 8;
         expect(cod_xmodel_to_obj(xm, 2, rig, o, parts, sizeof(parts), &obj, &sz) == 1, "rigged mesh");
         expect(obj && strstr((const char*)obj, "v 1 0 5\n") != NULL, "skinned world offset");
-        expect(obj && strstr((const char*)obj, "v 9 9 9\n") == NULL, "stored position ignored");
+        free(obj);
+        obj = NULL;
+
+        /* Two influences on the same bone: 0.5*(2,0,0) + 0.5*(0,2,0) + translation. */
+        o = 0;
+        memset(rig, 0, sizeof(rig));
+        put_u16(rig + o, 14); o += 2;
+        put_u16(rig + o, 1); o += 2;
+        rig[o++] = 0;
+        put_u16(rig + o, 3); o += 2;
+        put_u16(rig + o, 1); o += 2;
+        put_u16(rig + o, 0); o += 2;
+        put_u16(rig + o, 65535); o += 2;
+        o += 4;
+        rig[o++] = 3;
+        put_u16(rig + o, 0); o += 2;
+        put_u16(rig + o, 1); o += 2;
+        put_u16(rig + o, 2); o += 2;
+        for (v = 0; v < 3; v++) {
+            o += 12 + 8;
+            put_u16(rig + o, v == 0 ? 1 : 0); o += 2;
+            put_u16(rig + o, 1); o += 2;
+            if (v == 0) {
+                put_f32(rig + o, 2.f); o += 4;
+                o += 8;
+                put_f32(rig + o, 0.5f); o += 4;
+            } else {
+                o += 12;
+            }
+        }
+        put_u16(rig + o, 1); o += 2;
+        o += 4;
+        put_f32(rig + o, 2.f); o += 4;
+        o += 4;
+        put_f32(rig + o, 0.5f); o += 4;
+        expect(cod_xmodel_to_obj(xm, 2, rig, o, parts, sizeof(parts), &obj, &sz) == 1, "blended mesh");
+        expect(obj && strstr((const char*)obj, "v 1 1 5\n") != NULL, "primary plus additive");
         free(obj);
         obj = NULL;
     }
@@ -1498,7 +2115,7 @@ static void test_xmodel_bind_apply(void) {
     {
         unsigned char one[20 + 3 * 32];
         unsigned char two[4 + 112 * 2];
-        unsigned char skinxm[40];
+        unsigned char skinxm[160];
         const char* name = "metal@ford.dds";
         const char* text;
         const char* u1;
@@ -1512,11 +2129,7 @@ static void test_xmodel_bind_apply(void) {
         put_u16(two + 2, 2);
         memcpy(two + 4, one + 4, 112);
         memcpy(two + 4 + 112, one + 4, 112);
-        memset(skinxm, 0, sizeof(skinxm));
-        put_u16(skinxm, 14);
-        n = 2;
-        memcpy(skinxm + n, name, strlen(name) + 1);
-        n += strlen(name) + 1;
+        n = write_skin_xmodel(skinxm, sizeof(skinxm), &name, 1);
         expect(cod_xmodel_to_obj(skinxm, n, two, sizeof(two), NULL, 0, &obj, &sz) == 1, "short skin block");
         text = obj ? (const char*)obj : NULL;
         u1 = text ? strstr(text, "usemtl skins/metal@ford.png\n") : NULL;
@@ -1546,18 +2159,590 @@ static void test_xmodel_bind_apply(void) {
     report("test_xmodel_bind_apply", before);
 }
 
+#define HX_RETAIL_GROUPS 64
+#define HX_RETAIL_BONES 256
+
+typedef struct HxRetailGroup {
+    int count;
+    double sx, sy, sz;
+    float minx, maxx, miny, maxy;
+} HxRetailGroup;
+
+static int retail_parse_groups(const char* obj, unsigned size, HxRetailGroup* groups, int cap) {
+    const char* p = obj;
+    const char* end = obj + size;
+    int n = 0;
+    int cur = -1;
+
+    if (!obj) return -1;
+    while (p < end) {
+        const char* nl = memchr(p, '\n', (size_t)(end - p));
+        size_t len = nl ? (size_t)(nl - p) : (size_t)(end - p);
+        if (len >= 7 && memcmp(p, "usemtl ", 7) == 0) {
+            if (n >= cap) return -1;
+            cur = n++;
+            groups[cur].count = 0;
+            groups[cur].sx = groups[cur].sy = groups[cur].sz = 0.0;
+            groups[cur].minx = groups[cur].miny = 1e30f;
+            groups[cur].maxx = groups[cur].maxy = -1e30f;
+        } else if (cur >= 0 && len >= 2 && p[0] == 'v' && p[1] == ' ') {
+            char line[192];
+            float x, y, z;
+            if (len >= sizeof(line)) return -1;
+            memcpy(line, p, len);
+            line[len] = '\0';
+            if (sscanf(line + 2, "%f %f %f", &x, &y, &z) == 3) {
+                HxRetailGroup* g = &groups[cur];
+                g->count++;
+                g->sx += x;
+                g->sy += y;
+                g->sz += z;
+                if (x < g->minx) g->minx = x;
+                if (x > g->maxx) g->maxx = x;
+                if (y < g->miny) g->miny = y;
+                if (y > g->maxy) g->maxy = y;
+            }
+        }
+        p += len;
+        if (nl) p++;
+    }
+    return n;
+}
+
+static int retail_helix_groups(const CodArchive* ar, const char* name, HxRetailGroup* groups, int* nout) {
+    unsigned char* obj = NULL;
+    unsigned sz = 0;
+    int n;
+
+    if (!xmodel_to_helix(ar, name, &obj, &sz)) {
+        free(obj);
+        return 0;
+    }
+    n = retail_parse_groups((const char*)obj, sz, groups, HX_RETAIL_GROUPS);
+    free(obj);
+    if (n < 0) return 0;
+    *nout = n;
+    return 1;
+}
+
+static int retail_within_30(double ax, double ay, double az, double bx, double by, double bz) {
+    double dx = ax - bx;
+    double dy = ay - by;
+    double dz = az - bz;
+    return dx * dx + dy * dy + dz * dz <= 30.0 * 30.0;
+}
+
+static void retail_center(const HxRetailGroup* g, double* x, double* y, double* z) {
+    *x = g->sx / (double)g->count;
+    *y = g->sy / (double)g->count;
+    *z = g->sz / (double)g->count;
+}
+
+static int retail_largest(const HxRetailGroup* g, int n) {
+    int i, best = -1, best_n = -1;
+    for (i = 0; i < n; i++) {
+        if (g[i].count > best_n) {
+            best = i;
+            best_n = g[i].count;
+        }
+    }
+    return best;
+}
+
+static int retail_match_groups_to_bones(const HxRetailGroup* g, int ng, int largest,
+                                      const float* xyz, int nbones) {
+    int pick[4];
+    int n = 0;
+    int i, k;
+    char used_group[HX_RETAIL_GROUPS];
+
+    if (nbones <= 0 || nbones > HX_RETAIL_BONES || ng > HX_RETAIL_GROUPS) return 0;
+    memset(used_group, 0, sizeof(used_group));
+    for (k = 0; k < 4; k++) {
+        int best = -1;
+        double best_h = 0.0;
+        double cx, cy, cz;
+        for (i = 0; i < ng; i++) {
+            double h;
+            if (i == largest || used_group[i] || g[i].count <= 0) continue;
+            retail_center(&g[i], &cx, &cy, &cz);
+            h = cx * cx + cy * cy;
+            if (best < 0 || h > best_h) {
+                best = i;
+                best_h = h;
+            }
+        }
+        if (best < 0) return 0;
+        used_group[best] = 1;
+        pick[n++] = best;
+    }
+    for (k = 0; k < 4; k++) {
+        double cx, cy, cz;
+        int found = 0;
+        retail_center(&g[pick[k]], &cx, &cy, &cz);
+        for (i = 0; i < nbones; i++) {
+            if (!retail_within_30(cx, cy, cz, xyz[i * 3], xyz[i * 3 + 1], xyz[i * 3 + 2])) continue;
+            found = 1;
+            break;
+        }
+        if (!found) return 0;
+    }
+    return 1;
+}
+
+static int retail_peugeot_ok(const HxRetailGroup* ruled, int nr,
+                             const HxRetailGroup* raw, int nraw,
+                             const float* xyz, int nbones) {
+    int largest, raw_i;
+    double rcx, rcy, rcz, hx, hy, hz;
+
+    largest = retail_largest(ruled, nr);
+    raw_i = retail_largest(raw, nraw);
+    if (largest < 0 || raw_i < 0) return 0;
+    if (ruled[largest].count <= 0 || raw[raw_i].count <= 0) return 0;
+    retail_center(&ruled[largest], &rcx, &rcy, &rcz);
+    retail_center(&raw[raw_i], &hx, &hy, &hz);
+    if (!retail_within_30(rcx, rcy, rcz, hx, hy, hz)) return 0;
+    return retail_match_groups_to_bones(ruled, nr, largest, xyz, nbones);
+}
+
+static int retail_flak_ok(const HxRetailGroup* g, int n) {
+    int largest = retail_largest(g, n);
+    int i;
+    double lx, ly, lz;
+
+    if (largest < 0 || g[largest].count <= 0) return 0;
+    retail_center(&g[largest], &lx, &ly, &lz);
+    (void)lx;
+    (void)ly;
+    for (i = 0; i < n; i++) {
+        double cx, cy, cz;
+        if (i == largest || g[i].count <= 0) continue;
+        retail_center(&g[i], &cx, &cy, &cz);
+        if (cz > lz &&
+            cx >= (double)g[largest].minx && cx <= (double)g[largest].maxx &&
+            cy >= (double)g[largest].miny && cy <= (double)g[largest].maxy)
+            return 1;
+    }
+    return 0;
+}
+
+/* Vertices under a usemtl containing tag. want_y: |y| must exceed limit.
+ * Otherwise z must exceed limit. At least one matching vertex is required. */
+static int retail_mat_verts(const char* obj, unsigned size, const char* tag, int want_y, float limit) {
+    const char* p = obj;
+    const char* end = obj + size;
+    size_t ntag;
+    int on = 0;
+    int saw = 0;
+
+    if (!obj || !tag) return 0;
+    ntag = strlen(tag);
+    while (p < end) {
+        const char* nl = memchr(p, '\n', (size_t)(end - p));
+        size_t len = nl ? (size_t)(nl - p) : (size_t)(end - p);
+        if (len >= 7 && memcmp(p, "usemtl ", 7) == 0) {
+            size_t i;
+            on = 0;
+            for (i = 7; i + ntag <= len; i++) {
+                if (memcmp(p + i, tag, ntag) == 0) {
+                    on = 1;
+                    break;
+                }
+            }
+        } else if (on && len >= 2 && p[0] == 'v' && p[1] == ' ') {
+            char line[192];
+            float x, y, z;
+            if (len >= sizeof(line)) return 0;
+            memcpy(line, p, len);
+            line[len] = '\0';
+            if (sscanf(line + 2, "%f %f %f", &x, &y, &z) != 3) return 0;
+            (void)x;
+            saw = 1;
+            if (want_y) {
+                if (y > -limit && y < limit) return 0;
+            } else if (z <= limit) {
+                return 0;
+            }
+        }
+        p += len;
+        if (nl) p++;
+    }
+    return saw;
+}
+
+static void test_xmodel_retail_rule(void) {
+    int before = checkpoint();
+    const char* env = getenv("COD_MAIN");
+    const char* dir = (env && env[0]) ? env :
+        "C:/Program Files (x86)/Steam/steamapps/common/Call of Duty/Main";
+    DIR* opened = opendir(dir);
+    CodArchive* ar = NULL;
+    char pak[1024];
+    unsigned char* xm = NULL;
+    unsigned char* sf = NULL;
+    unsigned char* peu_parts = NULL;
+    unsigned char* obj = NULL;
+    unsigned xsz = 0, ssz = 0, psz = 0, osz = 0;
+    HxRetailGroup raw[HX_RETAIL_GROUPS];
+    int nraw = 0;
+    size_t dlen;
+
+    if (!opened) {
+        printf("test_xmodel_retail_rule: SKIP\n");
+        return;
+    }
+    closedir(opened);
+
+    ar = cod_archive_create();
+    expect(ar != NULL, "retail archive");
+    dlen = strlen(dir);
+    if (dlen > 0 && (dir[dlen - 1] == '/' || dir[dlen - 1] == '\\'))
+        snprintf(pak, sizeof(pak), "%spak0.pk3", dir);
+    else
+        snprintf(pak, sizeof(pak), "%s/pak0.pk3", dir);
+    expect(ar && cod_archive_add_zip(ar, pak) == 1, "pak0.pk3");
+
+    if (ar && cod_archive_read(ar, "xmodel/vehicle_peugeot_static", &xm, &xsz)) {
+        CodXmodelLod slots[4];
+        char surf[300];
+        int nslots = cod_xmodel_lod_slots(xm, xsz, slots, 4);
+        int s;
+        int n = -1;
+        surf[0] = '\0';
+        for (s = 0; s < nslots; s++) {
+            if (!slots[s].name[0]) continue;
+            snprintf(surf, sizeof(surf), "xmodelsurfs/%s", slots[s].name);
+            break;
+        }
+        if (surf[0] && cod_archive_read(ar, surf, &sf, &ssz) &&
+            cod_xmodel_to_obj(xm, xsz, sf, ssz, NULL, 0, &obj, &osz))
+            n = retail_parse_groups((const char*)obj, osz, raw, HX_RETAIL_GROUPS);
+        if (n >= 0) nraw = n;
+    }
+    free(obj);
+    free(sf);
+    free(xm);
+    obj = NULL;
+    sf = NULL;
+    xm = NULL;
+    if (ar) cod_archive_read(ar, "xmodelparts/peugtuot1", &peu_parts, &psz);
+
+    {
+        HxRetailGroup ruled[HX_RETAIL_GROUPS];
+        HxRetailGroup flak[HX_RETAIL_GROUPS];
+        float xyz[HX_RETAIL_BONES * 3];
+        int nr = 0, nf = 0, nbones = 0;
+        if (peu_parts)
+            nbones = cod_xmodel_world_translations(peu_parts, psz, xyz, HX_RETAIL_BONES);
+        expect(ar && retail_helix_groups(ar, "xmodel/vehicle_peugeot_static", ruled, &nr) &&
+                   retail_peugeot_ok(ruled, nr, raw, nraw, xyz, nbones),
+               "peugeot bind pose");
+        expect(ar && retail_helix_groups(ar, "xmodel/vehicle_tank_flakpanzer", flak, &nf) &&
+                   retail_flak_ok(flak, nf),
+               "flakpanzer turret");
+    }
+
+    if (ar && xmodel_to_helix(ar, "xmodel/static_vehicle_tank_tiger_snow", &obj, &osz) == 1) {
+        expect(retail_mat_verts((const char*)obj, osz, "TTroadwheel", 1, 40.f),
+               "tiger road wheels stay on the sides");
+        free(obj);
+        obj = NULL;
+    } else {
+        expect(0, "tiger obj");
+    }
+    if (ar && xmodel_to_helix(ar, "xmodel/static_vehicle_tank_PanzerIV", &obj, &osz) == 1) {
+        expect(retail_mat_verts((const char*)obj, osz, "wheeltredunwrap", 0, 2.f),
+               "panzer wheel tread stays off the ground");
+        free(obj);
+        obj = NULL;
+    } else {
+        expect(0, "panzer obj");
+    }
+
+    if (ar && cod_archive_read(ar, "xmodel/static_vehicle_german_truck", &xm, &xsz)) {
+        CodXmodelLod slots[4];
+        char names[64][160];
+        int nslots = cod_xmodel_lod_slots(xm, xsz, slots, 4);
+        int nskins = cod_xmodel_skin_names(xm, xsz, names, 64);
+        expect(nslots > 0 && strcmp(slots[0].name, "germmantruck0") == 0, "truck slot 0");
+        expect(nskins == 21, "truck high lod skins");
+        expect(nskins > 0 && strcmp(names[0], "metal@ford.dds") == 0, "truck first skin");
+        expect(xmodel_to_helix(ar, "xmodel/static_vehicle_german_truck", &obj, &osz) == 1, "truck obj");
+        expect(obj && strstr((const char*)obj, "usemtl skins/metal@ford.png") != NULL, "truck usemtl");
+        free(obj);
+        obj = NULL;
+    } else {
+        expect(0, "truck xmodel");
+    }
+    free(xm);
+    xm = NULL;
+
+    {
+        unsigned char* pt = NULL;
+        unsigned pt_sz = 0;
+        float xyz[HX_RETAIL_BONES * 3];
+        int n;
+        expect(ar && cod_archive_read(ar, "xmodelparts/Kubelwagen0", &pt, &pt_sz) == 1, "kubel parts");
+        n = pt ? cod_xmodel_world_translations(pt, pt_sz, xyz, HX_RETAIL_BONES) : -1;
+        expect(n == 1 && xyz[0] == 0.f && xyz[1] == 0.f && xyz[2] == 0.f, "kubel identity root");
+        free(pt);
+        pt = NULL;
+        expect(ar && cod_archive_read(ar, "xmodelparts/flak88_anti-tank0", &pt, &pt_sz) == 1, "flak88 parts");
+        n = pt ? cod_xmodel_world_translations(pt, pt_sz, xyz, HX_RETAIL_BONES) : -1;
+        expect(n == 1 && xyz[0] == 0.f && xyz[1] == 0.f && xyz[2] == 0.f, "flak88 identity root");
+        free(pt);
+    }
+
+    free(peu_parts);
+    cod_archive_destroy(ar);
+    report("test_xmodel_retail_rule", before);
+}
+
+/* One triangle soup. content_flags is the CoD material contents word. */
+static void put_u32(unsigned char* p, unsigned int v) {
+    p[0] = (unsigned char)(v & 255u);
+    p[1] = (unsigned char)((v >> 8) & 255u);
+    p[2] = (unsigned char)((v >> 16) & 255u);
+    p[3] = (unsigned char)((v >> 24) & 255u);
+}
+
+static int tiny_soup_bsp(const char* mat_name, unsigned int cflags, unsigned char** out, unsigned int* out_sz) {
+    const unsigned int hdr = 8u + 33u * 8u;
+    const unsigned int mat_n = 72u;
+    const unsigned int soup_n = 16u;
+    const unsigned int vert_n = 44u * 3u;
+    const unsigned int idx_n = 2u * 3u;
+    unsigned int total = hdr + mat_n + soup_n + vert_n + idx_n;
+    unsigned char* b;
+    unsigned int mat_at, soup_at, vert_at, idx_at, i;
+    if (!out || !out_sz) return 0;
+    b = (unsigned char*)calloc(1, total);
+    if (!b) return 0;
+    b[0] = 'I'; b[1] = 'B'; b[2] = 'S'; b[3] = 'P';
+    put_u32(b + 4, 59u);
+    mat_at = hdr;
+    soup_at = mat_at + mat_n;
+    vert_at = soup_at + soup_n;
+    idx_at = vert_at + vert_n;
+    put_u32(b + 8 + 0 * 8, mat_n);
+    put_u32(b + 8 + 0 * 8 + 4, mat_at);
+    put_u32(b + 8 + 6 * 8, soup_n);
+    put_u32(b + 8 + 6 * 8 + 4, soup_at);
+    put_u32(b + 8 + 7 * 8, vert_n);
+    put_u32(b + 8 + 7 * 8 + 4, vert_at);
+    put_u32(b + 8 + 8 * 8, idx_n);
+    put_u32(b + 8 + 8 * 8 + 4, idx_at);
+    for (i = 0; mat_name[i] && i < 63; i++) b[mat_at + i] = (unsigned char)mat_name[i];
+    put_u32(b + mat_at + 68, cflags);
+    put_u32(b + soup_at + 4, 0u); /* vertex_offset */
+    b[soup_at + 8] = 3;           /* vertex_count */
+    b[soup_at + 10] = 3;          /* triangle_count */
+    /* three positions so the triangle has area */
+    put_u32(b + vert_at + 0 * 44 + 0, 0x3f800000u); /* 1 */
+    put_u32(b + vert_at + 1 * 44 + 4, 0x3f800000u);
+    put_u32(b + vert_at + 2 * 44 + 8, 0x3f800000u);
+    b[idx_at + 2] = 1;
+    b[idx_at + 4] = 2;
+    *out = b;
+    *out_sz = total;
+    return 1;
+}
+
+static void test_fence_monsterclip_is_drawn(void) {
+    int before = checkpoint();
+    unsigned char* bsp = NULL;
+    unsigned int bsz = 0;
+    unsigned char* map = NULL;
+    unsigned int msz = 0;
+    const char* text;
+    expect(tiny_soup_bsp("textures/normandy/transparents/metal_masked@wiremesh1", 0x20030000u, &bsp, &bsz) == 1,
+           "wire bsp");
+    expect(bsp && bsp_to_helix(bsp, bsz, "wire", &map, &msz) == 1, "wire hxmap");
+    text = map ? (const char*)map : "";
+    expect(strstr(text, "metal_masked@wiremesh1") != NULL, "monsterclip fence is drawn");
+    expect(strstr(text, "contents playerclip") != NULL, "fence blocks players");
+    free(map);
+    free(bsp);
+    map = NULL;
+    bsp = NULL;
+    expect(tiny_soup_bsp("textures/common/clip", 0x28030200u, &bsp, &bsz) == 1, "clip bsp");
+    expect(bsp && bsp_to_helix(bsp, bsz, "clip", &map, &msz) == 1, "clip hxmap");
+    text = map ? (const char*)map : "";
+    expect(strstr(text, "textures/common/clip") == NULL, "clip texture stays hidden");
+    free(map);
+    free(bsp);
+    report("test_fence_monsterclip_is_drawn", before);
+}
+
+/* Material plus one terrain triangle at z=10 and one flat 3x3 curve at z=4. */
+static int tiny_terrain_bsp(unsigned int cflags, unsigned char** out, unsigned int* out_sz) {
+    const unsigned int hdr = 8u + 33u * 8u;
+    const unsigned int mat_n = 72u;
+    const unsigned int patch_n = 16u * 2u;
+    const unsigned int vert_n = 12u * (3u + 9u);
+    const unsigned int idx_n = 2u * 3u;
+    unsigned int total = hdr + mat_n + patch_n + vert_n + idx_n;
+    unsigned char* b;
+    unsigned int mat_at, patch_at, vert_at, idx_at, i;
+    const char* name = "textures/normandy/ground/dirt@oldpacked_large";
+    if (!out || !out_sz) return 0;
+    b = (unsigned char*)calloc(1, total);
+    if (!b) return 0;
+    b[0] = 'I'; b[1] = 'B'; b[2] = 'S'; b[3] = 'P';
+    put_u32(b + 4, 59u);
+    mat_at = hdr;
+    patch_at = mat_at + mat_n;
+    vert_at = patch_at + patch_n;
+    idx_at = vert_at + vert_n;
+    put_u32(b + 8 + 0 * 8, mat_n);
+    put_u32(b + 8 + 0 * 8 + 4, mat_at);
+    put_u32(b + 8 + 24 * 8, patch_n);
+    put_u32(b + 8 + 24 * 8 + 4, patch_at);
+    put_u32(b + 8 + 25 * 8, vert_n);
+    put_u32(b + 8 + 25 * 8 + 4, vert_at);
+    put_u32(b + 8 + 26 * 8, idx_n);
+    put_u32(b + 8 + 26 * 8 + 4, idx_at);
+    for (i = 0; name[i] && i < 63; i++) b[mat_at + i] = (unsigned char)name[i];
+    put_u32(b + mat_at + 68, cflags);
+    /* mode 1 triangle soup: 3 verts, 3 indexes, downward winding */
+    b[patch_at + 2] = 1;
+    b[patch_at + 4] = 3;
+    b[patch_at + 6] = 3;
+    /* mode 0 curve: 3x3, maxError 8, firstVert 3 */
+    b[patch_at + 16 + 4] = 3;
+    b[patch_at + 16 + 6] = 3;
+    put_u32(b + patch_at + 16 + 8, 8u);
+    put_u32(b + patch_at + 16 + 12, 3u);
+    put_f32(b + vert_at + 0, 0.f); put_f32(b + vert_at + 4, 0.f); put_f32(b + vert_at + 8, 10.f);
+    put_f32(b + vert_at + 12, 0.f); put_f32(b + vert_at + 16, 8.f); put_f32(b + vert_at + 20, 10.f);
+    put_f32(b + vert_at + 24, 8.f); put_f32(b + vert_at + 28, 0.f); put_f32(b + vert_at + 32, 10.f);
+    b[idx_at + 2] = 1;
+    b[idx_at + 4] = 2;
+    for (i = 0; i < 3; i++) {
+        for (int y = 0; y < 3; y++) {
+            unsigned int o = vert_at + (3u + (unsigned int)(y * 3 + i)) * 12u;
+            put_f32(b + o, (float)i);
+            put_f32(b + o + 4, (float)y);
+            put_f32(b + o + 8, 4.f);
+        }
+    }
+    *out = b;
+    *out_sz = total;
+    return 1;
+}
+
+static void test_terrain_collision(void) {
+    int before = checkpoint();
+    unsigned char* bsp = NULL;
+    unsigned int bsz = 0;
+    unsigned char* map = NULL;
+    unsigned int msz = 0;
+    const char* text;
+    expect(tiny_terrain_bsp(0x00000001u, &bsp, &bsz) == 1, "terrain bsp");
+    expect(bsp && bsp_to_helix(bsp, bsz, "ground", &map, &msz) == 1, "terrain hxmap");
+    text = map ? (const char*)map : "";
+    expect(strstr(text, "textures/common/clip") != NULL, "terrain collides without a second draw");
+    expect(strstr(text, "contents solid") != NULL, "terrain is solid");
+    expect(strstr(text, "0.0 0.0 10.0") != NULL, "terrain triangle height");
+    expect(strstr(text, "0.0 0.0 4.0") != NULL, "terrain curve height");
+    free(map);
+    free(bsp);
+    map = NULL;
+    bsp = NULL;
+    expect(tiny_terrain_bsp(0u, &bsp, &bsz) == 1, "nonsolid terrain bsp");
+    expect(bsp && bsp_to_helix(bsp, bsz, "ground", &map, &msz) == 1, "nonsolid terrain hxmap");
+    text = map ? (const char*)map : "";
+    expect(strstr(text, "textures/common/clip") == NULL, "nonsolid terrain is not a floor");
+    free(map);
+    free(bsp);
+    report("test_terrain_collision", before);
+}
+
+/* clipfoliage is a bush: the volume is not a wall, the top can still be landed on. */
+static int tiny_brush_bsp(const char* mat_name, unsigned char** out, unsigned int* out_sz) {
+    const unsigned int hdr = 8u + 33u * 8u;
+    const unsigned int mat_n = 72u;
+    const unsigned int brush_n = 4u;
+    const unsigned int side_n = 48u;
+    unsigned int total = hdr + mat_n + brush_n + side_n;
+    unsigned char* b;
+    unsigned int mat_at, brush_at, side_at, i;
+    if (!out || !out_sz) return 0;
+    b = (unsigned char*)calloc(1, total);
+    if (!b) return 0;
+    b[0] = 'I'; b[1] = 'B'; b[2] = 'S'; b[3] = 'P';
+    put_u32(b + 4, 59u);
+    mat_at = hdr;
+    brush_at = mat_at + mat_n;
+    side_at = brush_at + brush_n;
+    put_u32(b + 8 + 0 * 8, mat_n);
+    put_u32(b + 8 + 0 * 8 + 4, mat_at);
+    put_u32(b + 8 + 3 * 8, side_n);
+    put_u32(b + 8 + 3 * 8 + 4, side_at);
+    put_u32(b + 8 + 4 * 8, brush_n);
+    put_u32(b + 8 + 4 * 8 + 4, brush_at);
+    for (i = 0; mat_name[i] && i < 63; i++) b[mat_at + i] = (unsigned char)mat_name[i];
+    b[brush_at] = 6;
+    put_f32(b + side_at + 0 * 8, 0.f);
+    put_f32(b + side_at + 1 * 8, 32.f);
+    put_f32(b + side_at + 2 * 8, 0.f);
+    put_f32(b + side_at + 3 * 8, 32.f);
+    put_f32(b + side_at + 4 * 8, 0.f);
+    put_f32(b + side_at + 5 * 8, 48.f);
+    *out = b;
+    *out_sz = total;
+    return 1;
+}
+
+static void test_foliage_clip_is_a_top(void) {
+    int before = checkpoint();
+    unsigned char* bsp = NULL;
+    unsigned int bsz = 0;
+    unsigned char* map = NULL;
+    unsigned int msz = 0;
+    const char* text;
+    expect(tiny_brush_bsp("textures/common/clipfoliage", &bsp, &bsz) == 1, "foliage brush bsp");
+    expect(bsp && bsp_to_helix(bsp, bsz, "bush", &map, &msz) == 1, "foliage hxmap");
+    text = map ? (const char*)map : "";
+    expect(strstr(text, "brush {") == NULL, "bush volume is not a wall");
+    expect(strstr(text, "0.0 0.0 48.0") != NULL, "bush top stays landable");
+    expect(strstr(text, "contents solid") != NULL, "bush top is solid");
+    free(map);
+    free(bsp);
+    map = NULL;
+    bsp = NULL;
+    expect(tiny_brush_bsp("textures/common/clipplayer", &bsp, &bsz) == 1, "hedge brush bsp");
+    expect(bsp && bsp_to_helix(bsp, bsz, "hedge", &map, &msz) == 1, "hedge hxmap");
+    text = map ? (const char*)map : "";
+    expect(strstr(text, "contents playerclip") != NULL, "straight clip stays a wall");
+    free(map);
+    free(bsp);
+    report("test_foliage_clip_is_a_top", before);
+}
+
 int main(void) {
     test_plugin_create();
     test_archive_blob();
     test_bsp_names_and_header();
+    test_fence_monsterclip_is_drawn();
+    test_terrain_collision();
+    test_foliage_clip_is_a_top();
     test_xmodel_through_archive();
     test_xmodel_v14_lod();
+    test_view_basis_rigid();
+    test_view_tag_from_parts();
+    test_viewhand_text();
+    test_viewhand_idle_pose();
+    test_viewhand_pose_overlay();
+    test_viewhand_idle_retail();
     test_xmodel_lod_slots();
     test_xmodel_first_lod();
     test_xmodel_v14_surf();
     test_xmodel_skin_order();
     test_xmodel_bone_once();
     test_xmodel_bind_apply();
+    test_xmodel_retail_rule();
     test_sound_gameplay_alias();
     test_xanim();
     test_sound_ui_gsc();
@@ -1565,6 +2750,13 @@ int main(void) {
     test_plugin_bsp_open();
     test_cvar_menu_and_cache();
     test_gsc_vm();
+    test_gsc_vm_fib();
+    test_gsc_vm_array();
+    test_gsc_vm_far();
+    test_gsc_vm_thread();
+    test_gsc_vm_cullfog();
+    test_gsc_vm_funcref();
+    test_gsc_vm_float();
     if (g_fail) {
         fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;
