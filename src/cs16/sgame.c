@@ -137,6 +137,13 @@ static int cs_strcasecmp(const char* a, const char* b) {
     return tolower((unsigned char)*a) - tolower((unsigned char)*b);
 }
 
+static const char* cs_short_weapon(const char* name) {
+    if (!name) return "";
+    if (strncmp(name, "cs16.", 5) == 0) name += 5;
+    if (strcmp(name, "glock18") == 0) return "glock";
+    return name;
+}
+
 static float dist3(const float a[3], const float b[3]) {
     float dx = a[0] - b[0];
     float dy = a[1] - b[1];
@@ -951,10 +958,11 @@ static void update_player_animations(Cs16SGame* g) {
             else lower_clip = "cod/animations/cs16_idle.hxac";
         }
 
-        const char* wname = in.weapon_name ? in.weapon_name : "";
+        const char* wname = cs_short_weapon(in.weapon_name);
         int is_knife_or_c4 = (strcmp(wname, "knife") == 0 || strcmp(wname, "c4") == 0 || strcmp(wname, "hegrenade") == 0);
         int is_pistol = (!is_knife_or_c4 && (strcmp(wname, "glock") == 0 || strcmp(wname, "usp") == 0 ||
-                         strcmp(wname, "deagle") == 0 || strcmp(wname, "p228") == 0 || strcmp(wname, "fiveseven") == 0));
+                         strcmp(wname, "deagle") == 0 || strcmp(wname, "p228") == 0 || strcmp(wname, "fiveseven") == 0 ||
+                         strcmp(wname, "elites") == 0));
 
         const char* upper_clip = "cod/animations/cs16_aim_rifle.hxac";
         if (is_knife_or_c4) {
@@ -1035,8 +1043,7 @@ static void update_hud(Cs16SGame* g) {
     snprintf(money_buf, sizeof(money_buf), "$%d", g->clients[0].money);
 
     char ammo_buf[48];
-    const char* active_weap = g->imp->player_weapon_name ? g->imp->player_weapon_name(g->eng, 0, -1) : "";
-    if (!active_weap) active_weap = "";
+    const char* active_weap = cs_short_weapon(g->imp->player_weapon_name ? g->imp->player_weapon_name(g->eng, 0, -1) : "");
     if (strcmp(active_weap, "knife") == 0) {
         snprintf(ammo_buf, sizeof(ammo_buf), "KNIFE");
     } else if (strcmp(active_weap, "c4") == 0) {
@@ -1045,7 +1052,7 @@ static void update_hud(Cs16SGame* g) {
         int slot = 0;
         if (strcmp(active_weap, "glock") == 0 || strcmp(active_weap, "usp") == 0 ||
             strcmp(active_weap, "deagle") == 0 || strcmp(active_weap, "p228") == 0 ||
-            strcmp(active_weap, "fiveseven") == 0) {
+            strcmp(active_weap, "fiveseven") == 0 || strcmp(active_weap, "elites") == 0) {
             slot = 1;
         } else if (strcmp(active_weap, "hegrenade") == 0) {
             slot = 3;
@@ -1412,6 +1419,7 @@ static void cs16_init(hxServerGame* self, hxSGEngine* eng, hxSGImports* imp,
     }
     if (g->imp && g->imp->cvar_set) {
         g->imp->cvar_set(g->eng, "ui_menu_session", "ingame");
+        g->imp->cvar_set(g->eng, "ui_start_menu", "teamselect");
         g->imp->cvar_set(g->eng, "mp_allow_teamchange", "1");
     }
 
@@ -1469,20 +1477,10 @@ static void cs16_init(hxServerGame* self, hxSGEngine* eng, hxSGImports* imp,
         }
     }
 
-    const char* base_map = g->map_name;
-    const char* slash = strrchr(base_map, '/');
-    if (!slash) slash = strrchr(base_map, '\\');
-    if (slash) base_map = slash + 1;
-
-    if (strncmp(base_map, "de_", 3) == 0) g->mode = MODE_DE;
-    else if (strncmp(base_map, "cs_", 3) == 0) g->mode = MODE_CS;
-    else if (strncmp(base_map, "as_", 3) == 0) g->mode = MODE_AS;
+    if (strncmp(g->map_name, "de_", 3) == 0) g->mode = MODE_DE;
+    else if (strncmp(g->map_name, "cs_", 3) == 0) g->mode = MODE_CS;
+    else if (strncmp(g->map_name, "as_", 3) == 0) g->mode = MODE_AS;
     else g->mode = MODE_DE;
-
-    const char* gt_str = (g->mode == MODE_DE) ? "sd" : (g->mode == MODE_CS) ? "re" : (g->mode == MODE_AS) ? "as" : "dm";
-    if (g->imp && g->imp->cvar_set) {
-        g->imp->cvar_set(g->eng, "g_gametype", gt_str);
-    }
 
     g->score_t = 0;
     g->score_ct = 0;
@@ -1496,6 +1494,8 @@ static void cs16_init(hxServerGame* self, hxSGEngine* eng, hxSGImports* imp,
 
     query_map_spawns(g);
     query_objectives_from_bsp(g);
+
+    const char* gt_str = (g->mode == MODE_DE) ? "sd" : (g->mode == MODE_CS) ? "re" : "tdm";
     zbot_init(&g->zbot, g->eng, g->imp, g, cs16_bot_client_cmd, g->map_name, gt_str, "counterterrorist", "terrorist");
     g->zbot.attacking_team = 1;
 
@@ -1723,7 +1723,7 @@ static int cs16_player_damage_detail(hxServerGame* self, const hxSGDamage* dmg) 
     int amount = dmg->amount;
 
     /* Knife range & backstab check */
-    if (dmg->weapon && strcmp(dmg->weapon, "knife") == 0 && att >= 0 && att < MAX_CLIENTS) {
+    if (dmg->weapon && strcmp(cs_short_weapon(dmg->weapon), "knife") == 0 && att >= 0 && att < MAX_CLIENTS) {
         if (g->imp && g->imp->bot_state) {
             hxSGBotState ast, vst;
             if (g->imp->bot_state(g->eng, att, &ast) && g->imp->bot_state(g->eng, vic, &vst)) {
@@ -1813,7 +1813,7 @@ static void cs16_player_killed_detail(hxServerGame* self, const hxSGDamage* dmg)
     }
 
     if (g->imp && g->imp->player_obituary) {
-        const char* w = (dmg->weapon && *dmg->weapon) ? dmg->weapon : "glock";
+        const char* w = (dmg->weapon && *dmg->weapon) ? cs_short_weapon(dmg->weapon) : "glock";
         g->imp->player_obituary(g->eng, vic, (att >= 0 && att < MAX_CLIENTS) ? att : vic, w);
     }
 }
@@ -1825,17 +1825,6 @@ static int cs16_client_connect(hxServerGame* self, int client, const char* name)
     g->clients[client].active = 1;
     g->clients[client].is_bot = 0;
     int initial_team = (client == 0) ? 1 : ((client % 2) ? 1 : 2);
-    if (client == 0 && g->imp && g->imp->cvar_string) {
-        const char* ut = g->imp->cvar_string(g->eng, "ui_team");
-        if (!ut || !*ut) ut = g->imp->cvar_string(g->eng, "team");
-        if (ut && (strcmp(ut, "2") == 0 || cs_strcasecmp(ut, "ct") == 0 || cs_strcasecmp(ut, "counterterrorist") == 0)) {
-            initial_team = 2;
-        } else if (ut && (strcmp(ut, "0") == 0 || cs_strcasecmp(ut, "spectator") == 0)) {
-            initial_team = 0;
-        } else {
-            initial_team = 1;
-        }
-    }
     int start_money = 800;
     if (g->imp && g->imp->cvar_int) {
         int sm = g->imp->cvar_int(g->eng, "mp_startmoney");
@@ -1865,9 +1854,6 @@ static void cs16_client_spawn(hxServerGame* self, int client) {
     Cs16SGame* g = (Cs16SGame*)self;
     if (client < 0 || client >= MAX_CLIENTS) return;
     g->clients[client].active = 1;
-    if (client == 0 && g->clients[0].team <= 0) {
-        g->clients[0].team = 1;
-    }
     spawn_client_on_team(g, client);
     apply_player_model(g, client);
 }
@@ -1876,6 +1862,35 @@ static int cs16_console_command(hxServerGame* self, const char* cmd) {
     Cs16SGame* g = (Cs16SGame*)self;
     if (!cmd) return 0;
     if (g->zbot.initialized && zbot_console_command(&g->zbot, cmd)) return 1;
+
+    if (strncmp(cmd, "menuresponse ", 13) == 0) {
+        char menu[64] = {0}, resp[64] = {0};
+        if (sscanf(cmd + 13, "%63s %63s", menu, resp) == 2) {
+            /* Strip optional quotes */
+            char* m = menu;
+            if (*m == '"') { m++; size_t l = strlen(m); if (l > 0 && m[l - 1] == '"') m[l - 1] = '\0'; }
+            char* r = resp;
+            if (*r == '"') { r++; size_t l = strlen(r); if (l > 0 && r[l - 1] == '"') r[l - 1] = '\0'; }
+            if (cs_strcasecmp(m, "teamselect") == 0) {
+                if (strcmp(r, "1") == 0 || cs_strcasecmp(r, "t") == 0 || cs_strcasecmp(r, "terrorist") == 0 || cs_strcasecmp(r, "axis") == 0)
+                    return cs16_console_command(self, "jointeam 1");
+                if (strcmp(r, "2") == 0 || cs_strcasecmp(r, "ct") == 0 || cs_strcasecmp(r, "counterterrorist") == 0 || cs_strcasecmp(r, "allies") == 0)
+                    return cs16_console_command(self, "jointeam 2");
+                if (strcmp(r, "5") == 0 || cs_strcasecmp(r, "auto") == 0 || cs_strcasecmp(r, "autoassign") == 0)
+                    return cs16_console_command(self, "jointeam 5");
+                if (strcmp(r, "6") == 0 || cs_strcasecmp(r, "spectator") == 0)
+                    return cs16_console_command(self, "jointeam 6");
+            } else if (cs_strcasecmp(m, "classselect_t") == 0 || cs_strcasecmp(m, "classselect_ct") == 0) {
+                char sub[80];
+                snprintf(sub, sizeof(sub), "joinclass %s", r);
+                return cs16_console_command(self, sub);
+            } else if (cs_strcasecmp(m, "buymenu") == 0) {
+                char sub[80];
+                snprintf(sub, sizeof(sub), "buy %s", r);
+                return cs16_console_command(self, sub);
+            }
+        }
+    }
 
     if (strncmp(cmd, "g_gametype ", 11) == 0 || strncmp(cmd, "gametype ", 9) == 0) {
         const char* mode_str = strchr(cmd, ' ') + 1;

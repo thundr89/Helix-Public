@@ -89,43 +89,49 @@ static int cs16_define_weapons(const hxHostFacade* host) {
         int disposable;
         int melee_dmg;
         int melee_range;
+        int clip_only;
         const char* category;
+        const char* world_model;
+        const char* proj_model;
+        const char* scope;
+        const char* reticle;
     } kWeapons[] = {
-        /* Melee */
-        { 16, "cs16.knife", "Knife", 0, 400, 1, 1, 2, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 65, 64, "melee" },
+        /* Melee (Slot 2 -> key 3) */
+        { 16, "cs16.knife", "Knife", 0, 400, 0, 0, 1, 500, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 65, 64, 1, "pistol", "models/p_knife.obj", NULL, NULL, NULL },
 
-        /* Pistols (Slot 1) */
-        { 17, "cs16.glock18", "Glock-18", 25, 160, 20, 20, 1, 2200, 120, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "pistol" },
-        { 18, "cs16.usp", "USP .45", 30, 170, 12, 12, 1, 2500, 100, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "pistol" },
-        { 19, "cs16.p228", "P228", 28, 160, 13, 13, 1, 2700, 52, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "pistol" },
-        { 20, "cs16.deagle", "Desert Eagle", 54, 220, 7, 7, 1, 2200, 35, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "pistol" },
-        { 21, "cs16.fiveseven", "Five-Seven", 20, 160, 20, 20, 1, 2700, 100, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "pistol" },
-        { 22, "cs16.elites", "Dual Elites", 24, 130, 30, 30, 1, 3500, 120, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "pistol" },
+        /* Pistols (Slot 1 -> key 2) */
+        { 17, "cs16.glock18", "Glock-18", 28, 120, 20, 40, 0, 2200, 120, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 35, 64, 0, "pistol", "models/p_glock.obj", NULL, NULL, NULL },
+        { 18, "cs16.usp", "USP .45", 34, 140, 12, 24, 0, 2400, 100, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 35, 64, 0, "pistol", "models/p_usp.obj", NULL, NULL, NULL },
+        { 19, "cs16.p228", "P228", 32, 130, 13, 26, 0, 2400, 52, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 35, 64, 0, "pistol", "models/p_p228.obj", NULL, NULL, NULL },
+        { 20, "cs16.deagle", "Desert Eagle", 54, 220, 7, 14, 0, 2500, 35, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 35, 64, 0, "pistol", "models/p_deagle.obj", NULL, NULL, NULL },
+        { 21, "cs16.fiveseven", "Five-Seven", 30, 120, 20, 40, 0, 2400, 100, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 35, 64, 0, "pistol", "models/p_fiveseven.obj", NULL, NULL, NULL },
+        { 22, "cs16.elites", "Dual Elites", 28, 120, 30, 60, 0, 3500, 120, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 35, 64, 0, "pistol", "models/p_fiveseven.obj", NULL, NULL, NULL },
 
-        /* Shotguns (Slot 0) */
-        { 23, "cs16.m3", "M3 Super 90", 20, 900, 8, 8, 0, 3000, 32, 0, 6, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "shotgun" },
-        { 24, "cs16.xm1014", "XM1014", 20, 250, 7, 7, 0, 3000, 32, 1, 6, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "shotgun" },
+        /* Shotguns (Slot 0 -> key 1) */
+        { 23, "cs16.m3", "M3 Super 90", 26, 850, 8, 16, 0, 2800, 32, 0, 6, 3, 0, 0, 0, 0, 0, 0, 0, 0, 40, 64, 0, "shotgun", "models/p_m3.obj", NULL, NULL, NULL },
+        { 24, "cs16.xm1014", "XM1014", 22, 250, 7, 14, 0, 2600, 32, 1, 6, 3, 0, 0, 0, 0, 0, 0, 0, 0, 40, 64, 0, "shotgun", "models/p_xm1014.obj", NULL, NULL, NULL },
 
-        /* SMGs (Slot 0) */
-        { 25, "cs16.mp5", "MP5 Navy", 26, 110, 30, 30, 0, 2600, 120, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "smg" },
-        { 26, "cs16.tmp", "TMP", 20, 85, 30, 30, 0, 2100, 120, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "smg" },
-        { 27, "cs16.mac10", "MAC-10", 29, 85, 30, 30, 0, 3100, 100, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "smg" },
-        { 28, "cs16.ump45", "UMP45", 30, 130, 25, 25, 0, 3400, 100, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "smg" },
-        { 29, "cs16.p90", "ES P90", 21, 90, 50, 50, 0, 3400, 100, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "smg" },
+        /* SMGs (Slot 0 -> key 1) */
+        { 25, "cs16.mp5", "MP5 Navy", 26, 80, 30, 60, 0, 2600, 120, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 35, 64, 0, "smg", "models/p_mp5.obj", NULL, NULL, NULL },
+        { 26, "cs16.tmp", "TMP", 22, 75, 30, 60, 0, 2100, 120, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 35, 64, 0, "smg", "models/p_mp5.obj", NULL, NULL, NULL },
+        { 27, "cs16.mac10", "MAC-10", 29, 75, 30, 60, 0, 3100, 100, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 35, 64, 0, "smg", "models/p_mp5.obj", NULL, NULL, NULL },
+        { 28, "cs16.ump45", "UMP45", 30, 105, 25, 50, 0, 3400, 100, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 35, 64, 0, "smg", "models/p_mp5.obj", NULL, NULL, NULL },
+        { 29, "cs16.p90", "ES P90", 24, 70, 50, 100, 0, 3000, 100, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 35, 64, 0, "smg", "models/p_p90.obj", NULL, NULL, NULL },
 
-        /* Rifles & Snipers (Slot 0) */
-        { 30, "cs16.galil", "IDF Defender", 30, 110, 35, 35, 0, 2600, 90, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "rifle" },
-        { 31, "cs16.famas", "Clarion 5.56", 30, 110, 25, 25, 0, 3300, 90, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "rifle" },
-        { 32, "cs16.ak47", "AK-47", 36, 120, 30, 30, 0, 2400, 90, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "rifle" },
-        { 33, "cs16.m4a1", "M4A1 Carbine", 33, 110, 30, 30, 0, 3100, 90, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "rifle" },
-        { 34, "cs16.aug", "Bullpup", 32, 110, 30, 30, 0, 3300, 90, 1, 1, 1, 1, 55, 0, 0, 0, 0, 0, 0, 0, 0, "rifle" },
-        { 35, "cs16.sg552", "Krieg 552", 33, 110, 30, 30, 0, 3000, 90, 1, 1, 1, 1, 55, 0, 0, 0, 0, 0, 0, 0, 0, "rifle" },
-        { 36, "cs16.scout", "Schmidt Scout", 75, 1200, 10, 10, 0, 2800, 90, 0, 1, 0, 1, 40, 0, 0, 0, 0, 0, 0, 0, 0, "sniper" },
-        { 37, "cs16.awp", "AWP", 115, 1500, 10, 10, 0, 2700, 30, 0, 1, 0, 1, 30, 0, 0, 0, 0, 0, 0, 0, 0, "sniper" },
-        { 38, "cs16.m249", "M249 Para", 32, 100, 100, 100, 0, 4600, 200, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "heavy" },
+        /* Rifles & Snipers (Slot 0 -> key 1) */
+        { 30, "cs16.galil", "IDF Defender", 30, 90, 35, 70, 0, 2600, 90, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 40, 64, 0, "rifle", "models/p_galil.obj", NULL, NULL, NULL },
+        { 31, "cs16.famas", "Clarion 5.56", 30, 85, 25, 50, 0, 2600, 90, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 40, 64, 0, "rifle", "models/p_famas.obj", NULL, NULL, NULL },
+        { 32, "cs16.ak47", "AK-47", 36, 100, 30, 60, 0, 2500, 90, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 40, 64, 0, "rifle", "models/p_ak47.obj", NULL, NULL, NULL },
+        { 33, "cs16.m4a1", "M4A1 Carbine", 33, 90, 30, 60, 0, 3100, 90, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 40, 64, 0, "rifle", "models/p_m4a1.obj", NULL, NULL, NULL },
+        { 34, "cs16.aug", "Bullpup", 32, 95, 30, 60, 0, 3300, 90, 1, 1, 1, 1, 55, 0, 0, 0, 0, 0, 0, 40, 64, 0, "rifle", "models/p_m4a1.obj", NULL, NULL, NULL },
+        { 35, "cs16.sg552", "Krieg 552", 33, 95, 30, 60, 0, 3000, 90, 1, 1, 1, 1, 55, 0, 0, 0, 0, 0, 0, 40, 64, 0, "rifle", "models/p_ak47.obj", NULL, NULL, NULL },
+        { 36, "cs16.scout", "Schmidt Scout", 75, 1250, 10, 30, 0, 2000, 90, 0, 1, 0, 1, 30, 0, 0, 0, 0, 0, 0, 40, 64, 0, "sniper", "models/p_scout.obj", NULL, "textures/ui/scope_sniper", "cs16" },
+        { 37, "cs16.awp", "AWP", 115, 1450, 10, 20, 0, 2800, 30, 0, 1, 0, 1, 20, 0, 0, 0, 0, 0, 0, 40, 64, 0, "sniper", "models/p_awp.obj", NULL, "textures/ui/scope_sniper", "cs16" },
+        { 38, "cs16.m249", "M249 Para", 32, 85, 100, 200, 0, 4600, 200, 1, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 40, 64, 0, "heavy", "models/p_m4a1.obj", NULL, NULL, NULL },
 
-        /* Equipment (Slot 3) */
-        { 41, "cs16.hegrenade", "HE Grenade", 0, 1000, 1, 1, 3, 0, 1, 0, 1, 0, 0, 0, 2, 700, 2500, 250, 100, 1, 0, 0, "grenade" }
+        /* Equipment (Slot 2/3 -> key 4) */
+        { 39, "cs16.c4", "C4 Explosive", 0, 500, 1, 1, 2, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 1, "grenade", "models/p_c4.obj", NULL, NULL, NULL },
+        { 41, "cs16.hegrenade", "HE Grenade", 98, 800, 1, 1, 2, 0, 1, 0, 1, 0, 0, 0, 2, 720, 2000, 260, 98, 1, 0, 64, 0, "grenade", "models/p_hegrenade.obj", "models/w_hegrenade.obj", NULL, NULL }
     };
 
     const size_t num_weapons = sizeof(kWeapons) / sizeof(kWeapons[0]);
@@ -151,6 +157,7 @@ static int cs16_define_weapons(const hxHostFacade* host) {
         w.melee_damage = kWeapons[i].melee_dmg;
         w.melee_range = kWeapons[i].melee_range ? kWeapons[i].melee_range : 64;
         w.melee_delay_ms = 400;
+        w.clip_only = kWeapons[i].clip_only;
         w.ads = kWeapons[i].ads;
         w.ads_fov = kWeapons[i].ads_fov ? kWeapons[i].ads_fov : 55;
         w.ads_in_ms = 200;
@@ -162,6 +169,10 @@ static int cs16_define_weapons(const hxHostFacade* host) {
         w.explosion_damage = kWeapons[i].expl_damage;
         w.disposable = kWeapons[i].disposable;
         w.category = kWeapons[i].category;
+        w.world_model = kWeapons[i].world_model;
+        w.projectile_model = kWeapons[i].proj_model;
+        w.scope = kWeapons[i].scope;
+        w.reticle = kWeapons[i].reticle;
 
         if (!host->pack->define_weapon(host->pack->context, &w)) return 0;
     }
