@@ -626,13 +626,6 @@ int cs16_bsp_to_hxmap(const unsigned char* bsp_data, size_t bsp_size,
             if (strstr(mat, "sky") != NULL || strstr(mat, "aaatrigger") != NULL || strstr(mat, "clip") != NULL) {
                 continue;
             }
-            /* Apply backface culling to world geometry materials unless masked ('{' -> '_') */
-            if (strncmp(mat, "textures/", 9) == 0 && mat[9] != '_') {
-                size_t mlen = strlen(mat);
-                if (mlen + 10 < sizeof(mat)) {
-                    memcpy(mat + mlen, "*cull=back", 11);
-                }
-            }
 
             const BspPlane* pl = &planes[f->planenum];
             float fn[3] = {

@@ -370,6 +370,8 @@ static int tex_name_for_tga(const char* name, char* out, size_t cap) {
     if (len == 0) return 0;
     if (cs_ends_with(base, ".tga")) len -= 4;
     else if (strchr(base, '.') != NULL) return 0; /* other extension */
+    const char* star = memchr(base, '*', len);
+    if (star) len = (size_t)(star - base);
     if (len == 0 || len >= cap) return 0;
     memcpy(out, base, len);
     out[len] = '\0';
