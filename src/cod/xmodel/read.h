@@ -45,6 +45,8 @@ int cod_xmodel_lod_slots(const void* data, size_t size, CodXmodelLod* out, int c
 
 /* Viewmodels keep a hand skin. Body models drop it when another skin exists. */
 void cod_xmodel_set_keep_hands(int keep);
+void cod_xmodel_set_export_rig(int enabled);
+int cod_xanim_generic(const void* data,size_t size,unsigned char** out,unsigned* length);
 
 typedef struct CodXmodelBoneRule {
     int one_based;       /* Unused. Placement uses the engine's 0-based part index. */
@@ -71,8 +73,10 @@ int cod_xmodel_set_anim_pose(const void* xanim, size_t size);
 /* Merges frame 0 of another clip onto the pose. Bones already stored are replaced.
    A failed clip leaves the pose as it was. Returns 1 when the clip was merged. */
 int cod_xmodel_overlay_anim_pose(const void* xanim, size_t size);
+void cod_xmodel_remove_anim_bone(const char* name);
+int cod_xmodel_overlay_anim_frame(const void* xanim,size_t size,unsigned frame);
 
-/* Three lines. *out_buf is malloc'd. Returns 1. */
+/* Attachment lines; the archive exporter appends native ADS curves. malloc'd. */
 int cod_viewhand_text(const float tag[12], unsigned char** out_buf, unsigned int* out_size);
 
 /* Surface names of the first named LOD, after the collision block.

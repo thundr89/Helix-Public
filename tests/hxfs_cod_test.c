@@ -8,7 +8,7 @@
  * (at your option) any later version.
  */
 
-#include "iasset_plugin.h"
+#include "helix/fs/iasset_plugin.h"
 #include "archive/archive.h"
 #include "bsp/read.h"
 #include "bsp/names.h"
@@ -24,12 +24,13 @@
 #include "gsc/read.h"
 #include "gsc/helix.h"
 #include "gsc/vm.h"
-#include "texture/helix.h"
+#include "gsc/compile.h"
 #include "shader/helix.h"
 #include "cache.h"
 #include "zip_file.h"
 
 #include <stdio.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
@@ -65,6 +66,7 @@ static void test_plugin_create(void) {
     if (!p) return;
     expect(p->api_version == HELIX_ASSET_PLUGIN_API_VERSION, "api version");
     expect(p->format_name && strcmp(p->format_name, "cod") == 0, "format cod");
+    expect(p->contains(p,"ui/strings.hxloc"),"localization virtual file is discoverable");
     expect(p->open && p->contains && p->read && p->free_buf, "read fns");
     expect(p->list && p->free_list && p->close && p->destroy, "lifetime fns");
     expect(p->open_many && p->open_dir, "open fns");
@@ -431,6 +433,22 @@ static void test_viewhand_pose_overlay(void) {
     expect(cod_xmodel_overlay_anim_pose(NULL, 0) == 0, "empty overlay rejected");
     expect(cod_xmodel_view_tag(parts, parts_len, "tag_weapon", out) == 1, "pose still there");
     expect(out[11] > 4.f - 1e-4f && out[11] < 4.f + 1e-4f, "reject leaves the pose");
+    /* Sparse translation keys at 0 and 2 must interpolate frame 1. */
+    o=0;memset(ads,0,sizeof(ads));
+    put_u16(ads+o,14);o+=2;put_u16(ads+o,3);o+=2;put_u16(ads+o,1);o+=2;
+    ads[o++]=0;put_u16(ads+o,30);o+=2;ads[o++]=0;ads[o++]=0;
+    memcpy(ads+o,"tag_weapon",11);o+=11;
+    put_u16(ads+o,0);o+=2;put_u16(ads+o,2);o+=2;
+    ads[o++]=0;ads[o++]=2;
+    put_f32(ads+o,0);o+=4;put_f32(ads+o,0);o+=4;put_f32(ads+o,0);o+=4;
+    put_f32(ads+o,10);o+=4;put_f32(ads+o,0);o+=4;put_f32(ads+o,0);o+=4;
+    expect(cod_xmodel_overlay_anim_frame(ads,o,1)==1,"sparse middle frame sampled");
+    expect(cod_xmodel_view_tag(parts,parts_len,"tag_weapon",out)==1,"sampled sparse tag");
+    expect(fabsf(out[11]-5)<.0001f,"sparse translation interpolates neighboring keys");
+    expect(cod_xmodel_overlay_anim_frame(ads,o-1,1)==0,"truncated sparse clip rejected");
+    expect(cod_xmodel_view_tag(parts,parts_len,"tag_weapon",out)==1 && fabsf(out[11]-5)<.0001f,"invalid frame preserves valid pose");
+    cod_xmodel_remove_anim_bone("tag_weapon");
+    expect(cod_xmodel_view_tag(parts,parts_len,"tag_weapon",out)==1 && fabsf(out[11])<.0001f,"attachment root removed without clearing clip");
     cod_xmodel_set_anim_pose(NULL, 0);
     report("test_viewhand_pose_overlay", before);
 }
@@ -572,7 +590,9 @@ static void test_xmodel_v14_surf(void) {
     expect(cod_xmodel_to_obj(xm, sizeof(xm), surf, sizeof(surf), NULL, 0, &obj, &sz) == 1, "v14 obj");
     expect(obj && strstr((const char*)obj, "v 0 1 2\n") != NULL, "v14 vert");
     expect(obj && strstr((const char*)obj, "f 1/1/1 3/3/3 2/2/2\n") != NULL, "v14 face");
-    expect(cod_gameplay_xmodel("models/view_mg.obj") == NULL, "view mg is not a fixed alias");
+    expect(cod_gameplay_xmodel("models/view_mg.obj") != NULL &&
+               strstr(cod_gameplay_xmodel("models/view_mg.obj"), "viewmodel_m1garand") != NULL,
+           "view mg is the m1 garand");
     expect(cod_gameplay_xmodel("models/player.obj") != NULL, "player body");
     expect(cod_gameplay_xmodel("models/pickup.obj") == NULL, "pickup stays stock");
     {
@@ -586,7 +606,7 @@ static void test_xmodel_v14_surf(void) {
         obj = NULL;
         sz = 0;
         expect(cod_xmodel_to_obj(skinxm, skin_n, surf, sizeof(surf), NULL, 0, &obj, &sz) == 1, "skin obj");
-        expect(obj && strstr((const char*)obj, "usemtl skins/body@characterhand.png\n") != NULL, "first file-order skin");
+        expect(obj && strstr((const char*)obj, "usemtl skins/body@characterhand.dds\n") != NULL, "first file-order skin");
     }
     free(obj);
     report("test_xmodel_v14_surf", before);
@@ -633,7 +653,7 @@ static void test_xmodel_skin_order(void) {
     expect(strcmp(names[1], "metal@fordhub.dds") == 0, "second skin kept");
     cod_xmodel_set_keep_hands(0);
     expect(cod_xmodel_to_obj(xm, n, surf, sizeof(surf), NULL, 0, &obj, &sz) == 1, "prop convert");
-    expect(obj && strstr((const char*)obj, "usemtl skins/metal@ford.png\n") != NULL, "first skin");
+    expect(obj && strstr((const char*)obj, "usemtl skins/metal@ford.dds\n") != NULL, "first skin");
     expect(obj && strstr((const char*)obj, "characterhand") == NULL, "prop path does not sort");
     free(obj);
     obj = NULL;
@@ -647,7 +667,7 @@ static void test_xmodel_skin_order(void) {
     n = write_skin_xmodel(xm, sizeof(xm), hands, 2);
     cod_xmodel_set_keep_hands(1);
     expect(cod_xmodel_to_obj(xm, n, surf, sizeof(surf), NULL, 0, &obj, &sz) == 1, "viewmodel skins");
-    expect(obj && strstr((const char*)obj, "usemtl skins/viewmodel@bar_body.png\n") != NULL, "hand sorted behind flag");
+    expect(obj && strstr((const char*)obj, "usemtl skins/viewmodel@bar_body.dds\n") != NULL, "hand sorted behind flag");
     free(obj);
     cod_xmodel_set_keep_hands(0);
     report("test_xmodel_skin_order", before);
@@ -868,7 +888,7 @@ static void test_sound_ui_gsc(void) {
     expect(text && strstr(text, "open \"select\"") != NULL, "open");
     expect(text && strstr(text, "set \"g_gametype\" \"dm\"") != NULL, "setcvar");
     expect(text && strstr(text, "set \"g_timelimit\" \"15\"") != NULL, "timelimit cvar");
-    expect(text && strstr(text, "scr_foo") == NULL, "drop unknown set");
+    expect(text && strstr(text, "set \"scr_foo\" \"1\"") != NULL, "preserve valid mod cvar action");
     expect(text && strstr(text, "type image") != NULL, "image kept");
     expect(text && strstr(text, "SCORE") != NULL, "ownerdraw kept");
     expect(text && strstr(text, "play \"click\"") != NULL, "ownerdraw play kept");
@@ -916,6 +936,10 @@ static void test_sound_ui_gsc(void) {
                 "  itemDef { name resume type ITEM_TYPE_BUTTON text \"@MENU_BACKTOGAME\" }\n"
                 "}\n";
             expect(ui_loc_add_str("menu", str, strlen(str)) == 1, "str");
+            {unsigned char* exported=NULL;unsigned int length=0;
+             expect(ui_loc_export(&exported,&length)==1,"runtime localization export");
+             expect(exported && strstr((const char*)exported,"MENU_BACKTOGAME") && strstr((const char*)exported,"Back To Game"),"runtime localization retains package key and value");free(exported);}
+
             expect(ui_menu_to_helix(labeled, strlen(labeled), &out, &sz) == 1, "loc menu");
             text = (const char*)out;
             expect(text && strstr(text, "Back To Game") != NULL, "localized label");
@@ -1080,6 +1104,25 @@ static void test_sound_ui_gsc(void) {
                 "    rect 5 115 350 13\n"
                 "  }\n"
                 "}\n";
+            {const char* empty="menuDef {\n name \"options_graphics\"\n rect 0 0 400 400\n itemDef {\n name title\n type ITEM_TYPE_TEXT\n text \"Graphics\"\n rect 0 0 200 20\n decoration\n }\n itemDef {\n name quality\n type ITEM_TYPE_MULTI\n cvar \"ui_r_picmip\"\n rect 0 80 200 15\n }\n}\n";
+             unsigned char* menu_out=NULL;unsigned int menu_size=0;
+             expect(ui_menu_to_helix(empty,strlen(empty),&menu_out,&menu_size),"graphics rows without cvars translate safely");
+             expect(menu_out && strstr((char*)menu_out,"ui_textureQuality") && !strstr((char*)menu_out,"cvar \"r_picmip\""),"legacy quality row replaced by preset");free(menu_out);}
+            {
+                const char* unsupported[]={"r_allowExtensions","r_vertexlight","r_ati_pntriangles","r_ext_compressed_textures","ui_glCustom","r_fastsky","cg_skybox","ai_corpsecount","cg_coronafardist","cg_wolfparticles"};
+                unsigned k;
+                for(k=0;k<sizeof(unsupported)/sizeof(unsupported[0]);k++){
+                    char source[1400],binding[160];unsigned char* converted=NULL;unsigned converted_size=0;
+                    snprintf(source,sizeof(source),"menuDef {\n name %s\n itemDef {\n name legacy\n type ITEM_TYPE_MULTI\n text \"Legacy:\"\n cvar %s\n rect 5 100 350 13\n action { exec \"legacy_renderer_command\"; }\n }\n itemDef {\n name custom\n type ITEM_TYPE_MULTI\n cvar mod_quality\n rect 5 120 350 13\n }\n}\n",k<5?"options_graphics":"options_performance",unsupported[k]);
+                    snprintf(binding,sizeof(binding),"cvar \"%s\"",unsupported[k]);
+                    expect(ui_menu_to_helix(source,strlen(source),&converted,&converted_size),"stock unsupported row converts");
+                    expect(converted && !strstr((char*)converted,binding) && !strstr((char*)converted,"legacy_renderer_command"),"unused stock control has no binding or executable action");
+                    expect(converted && strstr((char*)converted,"hx_legacy_value_") && strstr((char*)converted,"decoration 1 scrollable 1"),"stock status stays in scrolling layout without hit target");
+                    expect(converted && strstr((char*)converted,"cvar \"mod_quality\""),"unknown mod option remains interactive");
+                    expect(converted && strstr((char*)converted,k==3?"Automatic":k==4?"Manual":"Unavailable"),"stock row describes effective support");
+                    free(converted);
+                }
+            }
             expect(ui_menu_to_helix(gfx, strlen(gfx), &out, &sz) == 1, "options rows");
             text = (const char*)out;
             expect(text && strstr(text, "cvar \"ui_vidmode\"") != NULL, "resolution uses helix mode");
@@ -1092,6 +1135,16 @@ static void test_sound_ui_gsc(void) {
             expect(text && strstr(text, "cvar \"r_borderless\"") != NULL, "borderless in graphics");
             expect(text && strstr(text, "cvar \"r_physical_falloff\"") != NULL, "falloff in graphics");
             expect(text && strstr(text, "cvar \"r_renderer\"") != NULL, "renderer in graphics");
+            expect(text && strstr(text,"name options_graphics_status") && strstr(text,"ui_gfx_texture_storage_requested") && strstr(text,"ui_gfx_texture_storage_effective") && strstr(text,"ui_gfx_texture_storage_reason"),"graphics status exposes requested effective and restriction data");
+            expect(text && strstr(text,"ui_renderer_requested") && strstr(text,"ui_renderer_effective") && strstr(text,"ui_renderer_reason"),"graphics status separates renderer request from active fallback");
+            expect(text && strstr(text,"open options_graphics_status") && strstr(text,"open options_graphics ;"),"graphics status navigation returns to graphics");
+            expect(text && strstr(text,"opengl33") && strstr(text,"OpenGL 3.3"),"GL33 renderer in graphics");
+#ifdef _WIN32
+            expect(text && strstr(text,"d3d9") && strstr(text,"d3d11"),"legacy Direct3D renderers in Windows graphics menu");
+#else
+            expect(text && !strstr(text,"d3d9") && !strstr(text,"d3d11"),"Direct3D renderers excluded from Linux graphics menu");
+#endif
+            expect(text && !strstr(text,"hx_texture_options") && strstr(text,"ui_textureQuality") && strstr(text,"\"Low\"") && strstr(text,"\"Normal\"") && strstr(text,"\"High\"") && !strstr(text,"r_textureMipBias") && !strstr(text,"r_textureMip\"") && strstr(text,"r_bumpScale") && strstr(text,"writeconfig") && strstr(text,"apply_system_settings") && strstr(text,"scrollRegion") && strstr(text,"codStyle 1"),"integrated system options use CoD style scrolling apply and save");
             expect(text && strstr(text, "cvar \"ui_gamepad\"") != NULL, "controller on look");
             free(out);
         }
@@ -1135,9 +1188,6 @@ static void test_sound_ui_gsc(void) {
 
 static void test_texture_shader_menu(void) {
     int before = checkpoint();
-    unsigned char tga[18 + 3];
-    unsigned char dds[128 + 8];
-    unsigned char* png = NULL;
     unsigned int sz = 0;
     const char* shader =
         "textures/test/wall\n"
@@ -1170,49 +1220,10 @@ static void test_texture_shader_menu(void) {
         "}\n";
     unsigned char* text = NULL;
     CodArchive* a;
-    memset(tga, 0, sizeof(tga));
-    tga[2] = 2;
-    tga[12] = 1;
-    tga[14] = 1;
-    tga[16] = 24;
-    tga[18] = 0;
-    tga[19] = 0;
-    tga[20] = 255;
-    expect(texture_to_png(tga, sizeof(tga), &png, &sz) == 1, "tga png");
-    expect(png && sz >= 8 && png[0] == 137 && png[1] == 'P' && png[2] == 'N' && png[3] == 'G', "png sig");
-    free(png);
-    png = NULL;
-    memset(dds, 0, sizeof(dds));
-    memcpy(dds, "DDS ", 4);
-    dds[8] = 124;
-    dds[12] = 4;
-    dds[16] = 4;
-    dds[80] = 0x4;
-    memcpy(dds + 84, "DXT1", 4);
-    dds[128] = 0xff;
-    dds[129] = 0xff;
-    dds[130] = 0xff;
-    dds[131] = 0xff;
-    expect(texture_to_png(dds, sizeof(dds), &png, &sz) == 1, "dxt1 png");
-    expect(png && png[0] == 137, "dxt1 sig");
-    free(png);
-    png = NULL;
-    {
-        unsigned char dxt3[128 + 16];
-        memset(dxt3, 0, sizeof(dxt3));
-        memcpy(dxt3, "DDS ", 4);
-        dxt3[12] = 4;
-        dxt3[16] = 4;
-        dxt3[80] = 0x4;
-        memcpy(dxt3 + 84, "DXT3", 4);
-        dxt3[128] = 0x0f;
-        expect(texture_to_png(dxt3, sizeof(dxt3), &png, &sz) == 1, "dxt3 png");
-        free(png);
-    }
     expect(shader_source_to_helix(shader, strlen(shader), &text, &sz) == 1, "shader");
     expect(text && strstr((char*)text, "material textures/test/wall") != NULL, "mtr name");
-    expect(text && strstr((char*)text, "albedo_map textures/test/bare.png") != NULL, "clamp path");
-    expect(text && strstr((char*)text, "albedo_map textures/test/wall.png") != NULL, "png path");
+    expect(text && strstr((char*)text, "albedo_map textures/test/bare\n") != NULL, "clamp path");
+    expect(text && strstr((char*)text, "albedo_map textures/test/wall.tga") != NULL, "source extension");
     free(text);
     {
         const char* rich =
@@ -1235,8 +1246,8 @@ static void test_texture_shader_menu(void) {
             "}\n";
         text = NULL;
         expect(shader_source_to_helix(rich, strlen(rich), &text, &sz) == 1, "rich shader");
-        expect(text && strstr((char*)text, "albedo_map textures/test/leaf.png") != NULL, "map not editor");
-        expect(text && strstr((char*)text, "editor.png") == NULL, "editor image dropped");
+        expect(text && strstr((char*)text, "albedo_map textures/test/leaf.tga") != NULL, "map not editor");
+        expect(text && strstr((char*)text, "editor.tga") == NULL, "editor image dropped");
         expect(text && strstr((char*)text, "twoSided") != NULL, "two sided");
         expect(text && strstr((char*)text, "blend alpha") != NULL, "blend");
         expect(text && strstr((char*)text, "alphaTest 0.5") != NULL, "alpha test");
@@ -1271,7 +1282,7 @@ static void test_texture_shader_menu(void) {
             "}\n";
         text = NULL;
         expect(shader_source_to_helix(deck, strlen(deck), &text, &sz) == 1, "deck flag shader");
-        expect(text && strstr((char*)text, "albedo_map textures/battleship/deckflag_np.png") != NULL, "deck flag image");
+        expect(text && strstr((char*)text, "albedo_map textures/battleship/deckflag_np.tga") != NULL, "deck flag image");
         expect(text && strstr((char*)text, "uvTransform 0.25 0 0 0.25 0.375 0.4375") != NULL, "deck flag uv");
         expect(text && strstr((char*)text, "blend additive") == NULL, "perlight add is not the base");
         free(text);
@@ -1450,7 +1461,7 @@ static void test_cvar_menu_and_cache(void) {
     expect(out && strstr((char*)out, "hideCvar \"0\"") != NULL, "hideCvar");
     expect(out && strstr((char*)out, "ingameclose \"main\"") != NULL, "ingameclose");
     expect(out && strstr((char*)out, "exec \"quit\"") != NULL, "uiscript quit");
-    expect(out && strstr((char*)out, "open \"map_select\"") != NULL, "uiscript startserver");
+    expect(out && strstr((char*)out, "start_server 0") && strstr((char*)out, "start_server 1") && strstr((char*)out, "start_server 2"), "uiscript startserver dispatches listen/LAN/dedicated modes");
     expect(out && strstr((char*)out, "type image") != NULL, "background image");
     expect(out && strstr((char*)out, "image \"ui/art\"") != NULL, "background path");
     free(out);
@@ -1564,7 +1575,7 @@ static void test_cvar_menu_and_cache(void) {
     }
     if (plugin && plugin->contains(plugin, "ui/plate.png")) {
         expect(plugin->read(plugin, "ui/plate.png", &out, &sz) == 1, "dds via png name");
-        expect(out && sz >= 4 && out[0] == 137 && out[1] == 'P', "dds still png");
+        expect(out && sz == sizeof(dds) && memcmp(out, dds, sizeof(dds)) == 0, "dds bytes unchanged");
         plugin->free_buf(plugin, out);
         out = NULL;
     } else {
@@ -2132,9 +2143,9 @@ static void test_xmodel_bind_apply(void) {
         n = write_skin_xmodel(skinxm, sizeof(skinxm), &name, 1);
         expect(cod_xmodel_to_obj(skinxm, n, two, sizeof(two), NULL, 0, &obj, &sz) == 1, "short skin block");
         text = obj ? (const char*)obj : NULL;
-        u1 = text ? strstr(text, "usemtl skins/metal@ford.png\n") : NULL;
+        u1 = text ? strstr(text, "usemtl skins/metal@ford.dds\n") : NULL;
         v1 = text ? strstr(text, "v 0 1 2\n") : NULL;
-        u2 = u1 ? strstr(u1 + 1, "usemtl skins/metal@ford.png\n") : NULL;
+        u2 = u1 ? strstr(u1 + 1, "usemtl skins/metal@ford.dds\n") : NULL;
         v2 = v1 ? strstr(v1 + 1, "v 0 1 2\n") : NULL;
         expect(u1 && v1 && u1 < v1, "skin before first mesh");
         expect(u2 && v2 && u2 < v2, "last skin before second mesh");
@@ -2452,6 +2463,18 @@ static void test_xmodel_retail_rule(void) {
         expect(0, "tiger obj");
     }
     if (ar && xmodel_to_helix(ar, "xmodel/static_vehicle_tank_PanzerIV", &obj, &osz) == 1) {
+        expect(strstr((const char*)obj,"lighting runtime\n")!=NULL,"native metal lightingDiffuse is exported rather than forced baked");
+        {
+            unsigned char* source=NULL;unsigned source_size=0;unsigned char* baked=NULL;unsigned baked_size=0;
+            const char* stype="{ /* rgbGen lightingDiffuse */ { map $texturename rgbGen lightingPrecalc } }";
+            (void)cod_archive_read(ar,"shadertypes/model/metal.stype",&source,&source_size);
+            expect(cod_archive_add_blob(ar,"shadertypes/model/metal.stype",stype,(unsigned)strlen(stype)),"override explicit baked shader");
+            expect(xmodel_to_helix(ar,"xmodel/static_vehicle_tank_PanzerIV",&baked,&baked_size) && strstr((const char*)baked,"lighting baked\n"),"explicit precalc survives while commented generators are ignored");
+            if(source)cod_archive_add_blob(ar,"shadertypes/model/metal.stype",source,source_size);
+            else {const char* diffuse="{ { rgbGen lightingDiffuse } }";cod_archive_add_blob(ar,"shadertypes/model/metal.stype",diffuse,(unsigned)strlen(diffuse));}
+            free(source);free(baked);
+        }
+
         expect(retail_mat_verts((const char*)obj, osz, "wheeltredunwrap", 0, 2.f),
                "panzer wheel tread stays off the ground");
         free(obj);
@@ -2469,7 +2492,7 @@ static void test_xmodel_retail_rule(void) {
         expect(nskins == 21, "truck high lod skins");
         expect(nskins > 0 && strcmp(names[0], "metal@ford.dds") == 0, "truck first skin");
         expect(xmodel_to_helix(ar, "xmodel/static_vehicle_german_truck", &obj, &osz) == 1, "truck obj");
-        expect(obj && strstr((const char*)obj, "usemtl skins/metal@ford.png") != NULL, "truck usemtl");
+        expect(obj && strstr((const char*)obj, "usemtl skins/metal@ford.dds") != NULL, "truck usemtl");
         free(obj);
         obj = NULL;
     } else {
@@ -2659,7 +2682,7 @@ static void test_terrain_collision(void) {
     report("test_terrain_collision", before);
 }
 
-/* clipfoliage is a bush: the volume is not a wall, the top can still be landed on. */
+/* Foliage volumes must not produce invisible player collision. */
 static int tiny_brush_bsp(const char* mat_name, unsigned char** out, unsigned int* out_sz) {
     const unsigned int hdr = 8u + 33u * 8u;
     const unsigned int mat_n = 72u;
@@ -2683,6 +2706,7 @@ static int tiny_brush_bsp(const char* mat_name, unsigned char** out, unsigned in
     put_u32(b + 8 + 4 * 8, brush_n);
     put_u32(b + 8 + 4 * 8 + 4, brush_at);
     for (i = 0; mat_name[i] && i < 63; i++) b[mat_at + i] = (unsigned char)mat_name[i];
+    put_u32(b + mat_at + 68, strstr(mat_name, "clipplayer") ? 0x10000u : 1u);
     b[brush_at] = 6;
     put_f32(b + side_at + 0 * 8, 0.f);
     put_f32(b + side_at + 1 * 8, 32.f);
@@ -2695,7 +2719,7 @@ static int tiny_brush_bsp(const char* mat_name, unsigned char** out, unsigned in
     return 1;
 }
 
-static void test_foliage_clip_is_a_top(void) {
+static void test_foliage_clip_is_nonsolid(void) {
     int before = checkpoint();
     unsigned char* bsp = NULL;
     unsigned int bsz = 0;
@@ -2706,8 +2730,8 @@ static void test_foliage_clip_is_a_top(void) {
     expect(bsp && bsp_to_helix(bsp, bsz, "bush", &map, &msz) == 1, "foliage hxmap");
     text = map ? (const char*)map : "";
     expect(strstr(text, "brush {") == NULL, "bush volume is not a wall");
-    expect(strstr(text, "0.0 0.0 48.0") != NULL, "bush top stays landable");
-    expect(strstr(text, "contents solid") != NULL, "bush top is solid");
+    expect(strstr(text, "mesh {") == NULL, "no invented bush top");
+    expect(strstr(text, "contents solid") == NULL, "bush is not solid");
     free(map);
     free(bsp);
     map = NULL;
@@ -2718,16 +2742,854 @@ static void test_foliage_clip_is_a_top(void) {
     expect(strstr(text, "contents playerclip") != NULL, "straight clip stays a wall");
     free(map);
     free(bsp);
-    report("test_foliage_clip_is_a_top", before);
+    report("test_foliage_clip_is_nonsolid", before);
+}
+
+static void test_brush_contents_and_ladder(void) {
+    int before = checkpoint();
+    const unsigned int flags[] = {0x28000000u, 0x28020000u, 0x2080u, 0x10000u, 0x10000u};
+    int i;
+    for (i = 0; i < 5; i++) {
+        unsigned char *bsp = NULL, *map = NULL; unsigned int bsz = 0, msz = 0;
+        expect(tiny_brush_bsp("textures/test/volume", &bsp, &bsz), "contents brush fixture");
+        put_u32(bsp + 8u + 33u * 8u + 68u, flags[i]);
+        if (i == 4) put_u32(bsp + 8u + 33u * 8u + 64u, 8u);
+        expect(bsp_to_helix(bsp, bsz, "contents", &map, &msz), "contents conversion");
+        if (i < 2) expect(strstr((const char*)map, "brush {") == NULL, "nonplayer contents do not block movement");
+        else if (i == 2) expect(strstr((const char*)map, "contents shotclip") != NULL, "projectile-only clips keep their purpose");
+        else if (i == 3) expect(strstr((const char*)map, "contents playerclip") != NULL, "playerclip contents survive without a name heuristic");
+        else expect(strstr((const char*)map, "contents ladder") != NULL, "ladder surface flag survives import");
+        free(map); free(bsp);
+    }
+    report("test_brush_contents_and_ladder", before);
+}
+
+
+
+static void test_initial_script_brushmodels(void) {
+    int before=checkpoint();
+    const char* entities="{ \"classname\" \"script_brushmodel\" \"model\" \"*1\" } "
+        "{ \"classname\" \"script_brushmodel\" \"model\" \"*2\" \"targetname\" \"exploder\" } "
+        "{ \"classname\" \"trigger_multiple\" \"model\" \"*3\" \"targetname\" \"minefield\" \"origin\" \"50 60 10\" }";
+    unsigned int hdr=8+33*8, mat=hdr, soups=mat+72, verts=soups+64, indices=verts+528;
+    unsigned int brushes=indices+24, sides=brushes+16, models=sides+192, ents=models+192;
+    unsigned int total=ents+(unsigned int)strlen(entities), i,j;
+    unsigned char* b=(unsigned char*)calloc(1,total); unsigned char* out=NULL; unsigned int out_size=0;
+    memcpy(b,"IBSP",4); put_u32(b+4,59);
+    put_u32(b+8+0*8,72);put_u32(b+12+0*8,mat);
+    put_u32(b+8+3*8,192);put_u32(b+12+3*8,sides);
+    put_u32(b+8+4*8,16);put_u32(b+12+4*8,brushes);
+    put_u32(b+8+6*8,64);put_u32(b+12+6*8,soups);
+    put_u32(b+8+7*8,528);put_u32(b+12+7*8,verts);
+    put_u32(b+8+8*8,24);put_u32(b+12+8*8,indices);
+    put_u32(b+8+27*8,192);put_u32(b+12+27*8,models);
+    put_u32(b+8+29*8,(unsigned int)strlen(entities));put_u32(b+12+29*8,ents);
+    strcpy((char*)b+mat,"textures/test/roof");put_u32(b+mat+68,1);
+    memcpy(b+ents,entities,strlen(entities));
+    for(i=0;i<4;++i){
+        unsigned int m=models+i*48, soup=soups+i*16;
+        put_u32(b+m+24,i);put_u32(b+m+28,1);put_u32(b+m+40,i);put_u32(b+m+44,1);
+        b[brushes+i*4]=6;
+        for(j=0;j<6;++j)put_f32(b+sides+i*48+j*8,j<2?i*100.f+(j%2)*16.f:(j%2)*16.f);
+        put_u32(b+soup+4,i*3);b[soup+8]=3;b[soup+10]=3;put_u32(b+soup+12,i*3);
+        for(j=0;j<3;++j){unsigned int v=verts+(i*3+j)*44;
+            put_f32(b+v,i*100.f+(j==1?16.f:0.f));put_f32(b+v+4,j==2?16.f:0.f);
+            put_f32(b+v+8,64.f);put_f32(b+v+36,1.f);b[indices+(i*3+j)*2]=(unsigned char)j;
+        }
+    }
+    expect(bsp_to_helix(b,total,"initial_roofs",&out,&out_size),"submodels convert");
+    expect(out && strstr((char*)out,"mins 100.0 0.0 0.0"),"intact roof collision included");
+    expect(out && strstr((char*)out,"v 100.0 0.0 64.0"),"intact roof surface included");
+    expect(out && strstr((char*)out,"mins 200.0") && strstr((char*)out,"v 200.0"),"destroyed replacement retained for script show");
+    expect(out && strstr((char*)out,"model 2\n  visible 0\n  linked 0"),"replacement initially hidden and unlinked");
+    expect(out && strstr((char*)out,"model 3\n  visible 0\n  linked 1"),"trigger submodel hidden but linked for overlap queries");
+    expect(out && strstr((char*)out,"mins 350.0 60.0 10.0") && strstr((char*)out,"contents trigger"),"trigger submodel applies entity origin offset and trigger contents");
+    expect(out && strstr((char*)out,"\"targetname\" \"exploder\""),"native script entity retained");
+    free(out);out=NULL;memset(b+mat,0,64);strcpy((char*)b+mat,"textures/common/nodraw_notsolid");
+    expect(bsp_to_helix(b,total,"trigger_tools",&out,&out_size),"tool-material trigger converts");
+    expect(out && strstr((char*)out,"model 3\n  visible 0\n  linked 1") && strstr((char*)out,"contents trigger"),"native trigger entity overrides non-solid tool material and retains overlap hull");
+    free(out);free(b);report("test_initial_script_brushmodels",before);
+}
+
+
+static void test_use_hint_menu(void) {
+    const char* menu="menuDef { name Cursorhints rect 300 325 40 40 visible 1 itemDef { name icon type 8 rect 0 0 40 40 ownerdraw 72 visible 1 } }";
+    unsigned char* out=NULL;unsigned int size=0;int before=checkpoint();
+    expect(ui_menu_to_helix(menu,strlen(menu),&out,&size),"cursor hint menu translates");
+    expect(out && strstr((char*)out,"gfx/icons/hint_usable.dds"),"native use hand icon retained");
+    expect(out && strstr((char*)out,"cvarTest \"ui_use_available\""),"cursor hint conditional on availability");
+    expect(out && strstr((char*)out,"showCvar \"1\""),"cursor hint visible while usable");
+    expect(out && strstr((char*)out,"cvar \"ui_use_text\"") && strstr((char*)out,"use_hint_text"),"use hand has an adjacent text prompt");
+    free(out);report("test_use_hint_menu",before);
+}
+
+static void test_skybox_shader_metadata(void) {
+    const char* text="textures/sky/test { surfaceparm sky skyParms env/native 512 - }";
+    CodShaderFile file;int before=checkpoint();
+    expect(shader_read(text,strlen(text),&file),"sky shader parses");
+    expect(file.count==1 && !strcmp(file.shaders[0].skybox,"env/native"),"native skyParms base retained");
+    shader_note_invisible(&file);expect(!strcmp(shader_skybox("textures/sky/test"),"env/native"),"BSP sky lookup");shader_read_free(&file);
+    {const char* entities="{ \"classname\" \"worldspawn\" }";unsigned int header=8+33*8,total=header+72+(unsigned)strlen(entities),size=0;unsigned char* bsp=(unsigned char*)calloc(1,total);unsigned char* out=NULL;
+     memcpy(bsp,"IBSP",4);put_u32(bsp+4,59);put_u32(bsp+8,72);put_u32(bsp+12,header);memcpy(bsp+header,"textures/sky/test",17);
+     put_u32(bsp+8+29*8,(unsigned)strlen(entities));put_u32(bsp+12+29*8,header+72);memcpy(bsp+header+72,entities,strlen(entities));
+     expect(bsp_to_helix(bsp,total,"sky_meta",&out,&size),"sky BSP translates");expect(out && strstr((char*)out,"environment_skybox"),"sky environment retained");expect(out && strstr((char*)out,"env/native_rt") && strstr((char*)out,"env/native_dn"),"sky face dependency names exported");free(out);free(bsp);}
+    report("test_skybox_shader_metadata",before);
+}
+static void test_native_vertex_blend_weights(void) {
+    const unsigned int header=8+33*8,mat=header,soup=mat+72,verts=soup+16,indices=verts+132,total=indices+6;
+    unsigned char* bsp=(unsigned char*)calloc(1,total);unsigned char* out=NULL;unsigned int size=0;int before=checkpoint(),i;
+    memcpy(bsp,"IBSP",4);put_u32(bsp+4,59);
+    put_u32(bsp+8,72);put_u32(bsp+12,mat);memcpy(bsp+mat,"textures/test/terrain",22);
+    put_u32(bsp+8+6*8,16);put_u32(bsp+12+6*8,soup);
+    bsp[soup+2]=255;bsp[soup+3]=255;bsp[soup+8]=3;bsp[soup+10]=3;
+    put_u32(bsp+8+7*8,132);put_u32(bsp+12+7*8,verts);
+    put_u32(bsp+8+8*8,6);put_u32(bsp+12+8*8,indices);bsp[indices+2]=1;bsp[indices+4]=2;
+    for(i=0;i<3;i++){float x=i==1?64.f:0.f,y=i==2?64.f:0.f,z=1.f;
+        memcpy(bsp+verts+i*44,&x,4);memcpy(bsp+verts+i*44+4,&y,4);memcpy(bsp+verts+i*44+36,&z,4);
+        bsp[verts+i*44+40]=255;bsp[verts+i*44+41]=128;bsp[verts+i*44+42]=64;bsp[verts+i*44+43]=(unsigned char)(i==2?255:i*128);
+    }
+    expect(bsp_to_helix(bsp,total,"vertex_blend",&out,&size),"vertex blend BSP translates");
+    expect(out && strstr((char*)out,"1.000000 0.501961 0.250980 0.000000"),"transparent authored vertex retained");
+    expect(out && strstr((char*)out,"1.000000 0.501961 0.250980 0.501961"),"continuous authored alpha retained");
+    expect(out && strstr((char*)out,"1.000000 0.501961 0.250980 1.000000"),"opaque authored vertex retained");
+    free(out);free(bsp);report("test_native_vertex_blend_weights",before);
+}
+
+static void test_stance_modes_and_hud(void) {
+    const char* text="menuDef {\n name options_move\n rect 0 0 400 400\n itemDef {\n name crouchmode\n type ITEM_TYPE_BIND\n cvar \"togglecrouch\"\n rect 5 220 350 13\n }\n itemDef {\n name pronemode\n type ITEM_TYPE_BIND\n cvar \"toggleprone\"\n rect 5 235 350 13\n }\n}\nmenuDef {\n name stance_hud\n itemDef {\n name stance\n ownerdraw 20\n rect 0 0 20 20\n }\n}\n";
+    unsigned char* out=NULL;unsigned int size=0;int before=checkpoint();
+    expect(ui_menu_to_helix(text,strlen(text),&out,&size),"stance menus translate");
+    expect(out && strstr((char*)out,"cl_crouchToggle") && strstr((char*)out,"cl_proneToggle"),"independent stance controls");
+    expect(out && strstr((char*)out,"\"Toggle\"") && strstr((char*)out,"\"Hold\""),"readable stance modes");
+    expect(out && strstr((char*)out,"cvar \"ui_stance\"") && strstr((char*)out,"stance_prone.dds") && strstr((char*)out,"stance_crouch.dds") && strstr((char*)out,"stance_stand.dds"),"three actual stance HUD images retained");
+    free(out);report("test_stance_modes_and_hud",before);
+}
+
+static void test_native_lightmap_image(void) {
+    const unsigned int bytes=512*512*3,header=8+33*8;
+    unsigned char* bsp=(unsigned char*)calloc(1,header+bytes);unsigned char* out=NULL;unsigned int size=0;
+    hxAssetPlugin* p=helix_asset_plugin_create();FILE* file;int before=checkpoint();
+    memcpy(bsp,"IBSP",4);put_u32(bsp+4,59);put_u32(bsp+16,bytes);put_u32(bsp+20,header);
+    bsp[header]=10;bsp[header+1]=20;bsp[header+2]=30;
+    bsp[header+bytes-3]=200;bsp[header+bytes-2]=100;bsp[header+bytes-1]=50;
+    file=fopen("mp_lightmap_test.bsp","wb");expect(file!=NULL,"fixture create");if(file){fwrite(bsp,1,header+bytes,file);fclose(file);}
+    expect(p && p->open(p,"mp_lightmap_test.bsp"),"fixture mount");
+    expect(p && p->contains(p,"codlightmaps/mp_lightmap_test/0.tga"),"virtual lightmap exists");
+    expect(p && !p->contains(p,"codlightmaps/mp_lightmap_test/1.tga"),"out of range lightmap rejected");
+    expect(p && !p->contains(p,"codlightmaps/mp_lightmap_test/-1.tga"),"negative lightmap rejected");
+    expect(p && p->read(p,"codlightmaps/mp_lightmap_test/0.tga",&out,&size),"native lightmap read");
+    expect(size==18+bytes && out && out[17]==32,"512px top origin TGA");
+    expect(out && out[18]==60 && out[19]==40 && out[20]==20,"native lighting gain and BGR order");
+    expect(out && out[size-1]==255 && out[size-2]==127 && out[size-3]==63,"overbright preserves hue");
+    if(p){p->free_buf(p,out);p->destroy(p);}free(bsp);remove("mp_lightmap_test.bsp");report("test_native_lightmap_image",before);
+}
+
+static void test_native_spawn_metadata(void) {
+    const char* entities="{ \"classname\" \"worldspawn\" \"suncolor\" \"100 100 105\" }"
+                         "{ \"classname\" \"mp_deathmatch_spawn\" \"origin\" \"10 20 100\" }"
+                         "{ \"classname\" \"mp_deathmatch_intermission\" \"origin\" \"30 40 50\" }"
+                         "{ \"classname\" \"misc_mg42\" \"model\" \"xmodel/mg42_bipod\" \"origin\" \"0 0 30\" }"
+                         "{ \"classname\" \"script_model\" \"model\" \"xmodel/barrel_green2snowy\" \"lightingPrecalc\" \"0 0 0\" }";
+    unsigned int hdr=8+33*8,total=hdr+(unsigned int)strlen(entities),n=0;
+    unsigned char* bsp=(unsigned char*)calloc(1,total);unsigned char* out=NULL;int before=checkpoint();
+    memcpy(bsp,"IBSP",4);put_u32(bsp+4,59);
+    put_u32(bsp+8+29*8,(unsigned int)strlen(entities));put_u32(bsp+12+29*8,hdr);
+    memcpy(bsp+hdr,entities,strlen(entities));
+    expect(bsp_to_helix(bsp,total,"spawnmeta",&out,&n),"spawn metadata conversion");
+    expect(out && strstr((char*)out,"\"classname\" \"info_player_deathmatch\""),"host spawn class retained");
+    expect(out && strstr((char*)out,"\"cod_classname\" \"mp_deathmatch_spawn\""),"native spawn class retained");
+    expect(out && strstr((char*)out,"\"cod_origin\" \"10 20 100\""),"native feet retained");
+    expect(out && strstr((char*)out,"\"origin\" \"10.0 20.0 132.0\""),"legacy fallback centre retained before placement");
+    expect(out && strstr((char*)out,"\"spawn_anchor\" \"1\""),"generic anchor tag");
+    expect(out && strstr((char*)out,"\"classname\" \"mp_deathmatch_intermission\""),"intermission metadata retained");
+    expect(out && strstr((char*)out,"\"render_model\" \"1\""),"native MG42 render instance retained");
+    expect(out && strstr((char*)out,"\"lightingColor\" \"-1 -1 -1\""),"zero native baked sample falls back to runtime lighting");
+    expect(out && strstr((char*)out,"\"suncolor\" \"0.952380955 0.952380955 1\""),"legacy sun hue normalized before host lighting");
+    free(out);free(bsp);report("test_native_spawn_metadata",before);
+}
+
+static void test_opaque_window_base_stage(void) {
+    int before = checkpoint(); unsigned char* out = NULL; unsigned int size = 0;
+    const char* shader = "textures/austria/windows/barrackswindow3 { surfaceparm opaqueglass "
+        "{ map textures/austria/windows/glass_nosight@barracksw3.jpg rgbGen identity } "
+        "{ map $lightmap blendFunc filter } "
+        "{ map textures/austria/windows/barrackswindow3.blend.tga blendFunc add } "
+        "{ perlight map textures/austria/windows/other.tga blendFunc add } }";
+    expect(shader_source_to_helix(shader, strlen(shader), &out, &size), "opaque window conversion");
+    expect(out && strstr((char*)out,"albedo_map textures/austria/windows/glass_nosight@barracksw3.jpg"), "base image preserved");
+    expect(out && !strstr((char*)out,"blend additive") && !strstr((char*)out,"blend alpha"), "lighting stage does not make window transparent");
+    free(out); report("test_opaque_window_base_stage", before);
+}
+
+
+static void test_hud_and_quickmenu_bridge(void) {
+    int before = checkpoint(); unsigned char* out = NULL; unsigned int size = 0;
+    const char* menu = "menuDef { name quickcommands onOpen { setCvar cl_bypassMouseInput 1 } "
+        "onClose { setCvar cl_bypassMouseInput 0 } execKey \"1\" { scriptMenuResponse \"1\"; close quickcommands; } "
+        "itemDef { name health ownerdraw 89 rect 0 0 100 8 background \"health.dds\" } "
+        "itemDef { name compass ownerdraw 84 rect 0 0 80 80 background \"compass.dds\" } }";
+    expect(ui_menu_to_helix(menu, strlen(menu), &out, &size), "HUD and key menu convert");
+    expect(out && strstr((char*)out,"type bar") && strstr((char*)out,"cvar \"ui_health\""), "health binds to player state");
+    expect(out && strstr((char*)out,"rotationCvar \"ui_view_yaw\""), "compass retains rotation binding");
+    expect(out && strstr((char*)out,"onClose") && strstr((char*)out,"execKey \"1\""), "lifecycle and key actions preserved");
+    expect(out && strstr((char*)out,"menuresponse") && strstr((char*)out,"quickcommands") && !strstr((char*)out,"weapon 1"), "voice response is not mistaken for weapon selection");
+    expect(out && strstr((char*)out,"set \"cl_bypassMouseInput\" \"1\""), "mixed case native setCvar recognized");
+    free(out);report("test_hud_and_quickmenu_bridge", before);
+}
+
+static void test_native_game_menu_layout(void) {
+    int before = checkpoint(); unsigned char* out = NULL; unsigned int size = 0;
+    const char* menu = "menuDef { name weapon_german focuscolor 1 1 1 1 "
+        "itemDef { name desc visible 0 origin 296 220 rect 0 0 224 64 autowrapped text \"A rifle description\" } "
+        "itemDef { name stats origin 296 330 text \"Accuracy\" } "
+        "itemDef { name limit type 9 rect 0 0 350 12 cvar ui_dm_scorelimit text \"Score limit\" decoration } "
+        "execKey \"t\" { scriptMenuResponse \"team\"; close weapon_german; } }";
+    expect(ui_menu_to_helix(menu, strlen(menu), &out, &size), "native weapon menu converts");
+    expect(out && strstr((char*)out, "textWrap 1") && strstr((char*)out, "visible 0"), "wrapping and initial visibility retained");
+    expect(out && strstr((char*)out, "rect 296 330 0 0"), "origin without rect retained");
+    expect(out && strstr((char*)out, "type numericfield") && strstr((char*)out, "ui_dm_scorelimit"), "numeric server information retains its native field type");
+    expect(out && strstr((char*)out, "menuresponse") && strstr((char*)out, "weapon_german") && !strstr((char*)out,"weapon team"), "team tab is navigation rather than a weapon");
+    expect(out && strstr((char*)out, "focuscolor 1 1 1 1"), "menu focus color reaches its items");
+    free(out);
+    {
+        const char* options="menuDef {name options itemDef {name quality type ITEM_TYPE_MULTI cvar r_picmip cvarFloatList { Low 2 Normal 1 High 0 } } itemDef {name limit type ITEM_TYPE_NUMERICFIELD cvarFloat g_timelimit 30 1 999 maxChars 3 } itemDef {name player type ITEM_TYPE_EDITFIELD cvar name maxChars 24 } itemDef {name filter type ITEM_TYPE_MULTI cvar r_textureMode cvarStrList { \"Bilinear\", \"GL_LINEAR_MIPMAP_NEAREST\", \"Trilinear\", \"GL_LINEAR_MIPMAP_LINEAR\" } } }";
+        out=NULL;size=0;expect(ui_menu_to_helix(options,strlen(options),&out,&size),"native settings translate");
+        expect(out && strstr((char*)out,"cvarDefault \"30\""),"native cvarFloat default is retained");
+        expect(out && strstr((char*)out,"type multi") && strstr((char*)out,"choices { \"2\" \"Low\" \"1\" \"Normal\" \"0\" \"High\""),"native discrete labels and values retained");
+        expect(out && strstr((char*)out,"GL_LINEAR_MIPMAP_NEAREST") && strstr((char*)out,"Trilinear"),"comma separated native string choices retained");
+        expect(out && strstr((char*)out,"type numericfield") && strstr((char*)out,"numericRange 1") && strstr((char*)out,"maxChars 3") && strstr((char*)out,"type editfield"),"numeric range and editable text retained");free(out);
+    }
+ report("test_native_game_menu_layout", before);
+}
+
+static void test_sound_csv_native_preamble(void) {
+    int before = checkpoint(); SoundAliasFile aliases;
+    const char* csv = "\"# comment with \"\"quoted\"\" words\",,\r\n,name,description\r\n"
+        "name,file,vol_min,channel,loop\r\nambient_test,ambient/night.wav,0.5,local,looping\r\n";
+    expect(sound_read_aliases(csv, strlen(csv), &aliases), "native CSV preamble skipped");
+    expect(aliases.count == 1 && strcmp(aliases.aliases[0].name,"ambient_test") == 0, "ambient alias survives native comments");
+    sound_read_free(&aliases);report("test_sound_csv_native_preamble", before);
+}
+
+static int pc_count, pc_kinds[8], pc_layout;
+static char pc_names[8][96];
+static void test_pc(void* user, int kind, const char* name) {
+    (void)user;
+    if (pc_count < 8) { pc_kinds[pc_count] = kind; snprintf(pc_names[pc_count], 96, "%s", name); }
+    ++pc_count;
+}
+static void test_pc_cvar(void* user, const char* key, const char* value) {
+    (void)user; pc_layout = strcmp(key, "scr_layoutimage") == 0 && strcmp(value, "layout") == 0;
+}
+static void test_gsc_precache_host(void) {
+    int before = checkpoint(); GscHost host;
+    const char* source = "main(){ n = \"tree\"; precacheModel(n); precacheSound(\"voice\"); precacheShader(\"gfx/hud/foo\"); precacheItem(\"kar98k_mp\"); fx = loadFx(\"explosions/test\"); setcvar(\"scr_layoutimage\",\"layout\"); return fx == \"explosions/test\"; }";
+    memset(&host, 0, sizeof(host)); host.precache = test_pc; host.set_cvar = test_pc_cvar;
+    pc_count = pc_layout = 0;
+    expect(gsc_vm_exec(source, strlen(source), "main", &host) == 1, "precache VM executes");
+    expect(pc_count == 5, "all five dependency types reach the host");
+    expect(pc_kinds[0] == GSC_PC_MODEL && strcmp(pc_names[0], "tree") == 0, "computed model argument preserved");
+    expect(pc_kinds[1] == GSC_PC_SOUND && pc_kinds[2] == GSC_PC_SHADER && pc_kinds[3] == GSC_PC_WEAPON && pc_kinds[4] == GSC_PC_FX, "dependency kinds preserved");
+    expect(pc_layout == 1, "layout cvar reaches host");
+    expect(gsc_vm_last_int == 1, "loadFx returns a reusable script handle");
+    report("test_gsc_precache_host", before);
+}
+
+
+static void test_native_dependency_descriptors(void) {
+    int before=checkpoint(); const char* file="hxpc_dependencies_test.pk3";
+    const char* weapon="WEAPONFILE\\gunModel\\viewmodel_test\\worldModel\\xmodel/world_test\\fireSound\\test_fire\\viewFlashEffect\\fx/test.efx\\idleAnim\\idle_test\\altWeapon\\other_mp";
+    const char* effect="Particle { shaders [ gfx/a \"gfx/b\" ] models [ debris ] sounds [ test_fire ] effects [ test ] }";
+    ZipItem items[2];hxAssetPlugin* plugin;unsigned char* text=NULL;unsigned size=0;
+    items[0].name="weapons/mp/test_mp";items[0].data=weapon;items[0].size=(unsigned)strlen(weapon);
+    items[1].name="fx/test.efx";items[1].data=effect;items[1].size=(unsigned)strlen(effect);
+    expect(write_stored_pk3(file,items,2)==1,"dependency fixture archive");
+    plugin=helix_asset_plugin_create();expect(plugin&&plugin->open(plugin,file),"dependency plugin open");
+    if (plugin) {
+        expect(plugin->contains(plugin,"weapons/mp/test_mp.hxprecache"),"virtual weapon descriptor exists");
+        expect(plugin->read(plugin,"weapons/mp/test_mp.hxprecache",&text,&size),"weapon descriptor translated");
+        expect(text&&strstr((char*)text,"model \"xmodel/viewmodel_test\"")&&strstr((char*)text,"sound \"test_fire\"")&&strstr((char*)text,"data \"xanim/idle_test\""),"weapon dependencies typed and normalized");
+        if(text)plugin->free_buf(plugin,text);text=NULL;
+        expect(plugin->read(plugin,"fx/test.efx.hxprecache",&text,&size),"FX descriptor translated");
+        expect(text&&strstr((char*)text,"shader \"gfx/a\"")&&strstr((char*)text,"shader \"gfx/b\"")&&strstr((char*)text,"fx \"fx/test.efx\""),"FX lists and quoted names normalized");
+        if(text)plugin->free_buf(plugin,text);
+        expect(!plugin->contains(plugin,"fx/missing.efx.hxprecache"),"missing descriptor is absent");
+        plugin->destroy(plugin);
+    }
+    remove(file);report("test_native_dependency_descriptors",before);
+}
+
+static int rt_test_fails,rt_test_visible=1,rt_test_linked=1,rt_test_reads;
+#define RT_CHECK(x) do {if(!(x)){printf("FAIL line %d: %s\n",__LINE__,#x);rt_test_fails++;}}while(0)
+static void rt_test_error(void* u,const char* s){(void)u;printf("VM: %s\n",s);}
+static int rt_test_find(void* u,const char* k,const char* v,int* ids,int cap){(void)u;if(strcmp(k,"targetname") || strcmp(v,"door"))return 0;if(cap)ids[0]=7;return 1;}
+static const char* rt_test_key(void* u,int id,const char* k){(void)u;return id==7 && !strcmp(k,"targetname")?"door":id==7 && !strcmp(k,"classname")?"script_model":"";}
+static int rt_test_state(void* u,int id,int v,int l){(void)u;if(id!=7)return 0;if(v>=0)rt_test_visible=v;if(l>=0)rt_test_linked=l;return 1;}
+static int rt_test_readfile(void* u,const char* p,char** text,size_t* size){const char* s="pause(){wait 0.1; level.far=9;}";(void)u;rt_test_reads++;if(strcmp(p,"lib.gsc"))return 0;*size=strlen(s);*text=malloc(*size+1);strcpy(*text,s);return 1;}
+static int rt_test_field(GscRuntime* r,const char* k){int n=-999;gsc_runtime_level_int(r,k,&n);return n;}
+static GscRuntime* rt_test_runtime(const char* s){GscHost h={0};GscRuntime* r;h.error=rt_test_error;h.entity_find=rt_test_find;h.entity_key=rt_test_key;h.entity_state=rt_test_state;h.read_file=rt_test_readfile;r=gsc_runtime_create(&h);RT_CHECK(r!=NULL);RT_CHECK(gsc_runtime_start(r,"test.gsc",s,strlen(s),"main",-1));return r;}
+static void test_gsc_runtime(void){GscRuntime* r;GscArgument arg={1,42,0,NULL};int before;
+ r=rt_test_runtime("main(){level.n=1; nested(); level.n=level.n+1;} nested(){wait 0.1;level.n=level.n+2;}");
+ gsc_runtime_tick(r,0,10000);RT_CHECK(rt_test_field(r,"n")==1);RT_CHECK(gsc_runtime_threads(r)==1);
+ gsc_runtime_tick(r,99,10000);RT_CHECK(rt_test_field(r,"n")==1);gsc_runtime_tick(r,100,10000);RT_CHECK(rt_test_field(r,"n")==4);RT_CHECK(gsc_runtime_threads(r)==0);RT_CHECK(!gsc_runtime_errors(r));gsc_runtime_destroy(r);
+ r=rt_test_runtime("main(){thread listen();level.notify(\"go\",42);wait 0;level.done=1;} listen(){level waittill(\"go\",n);level.payload=n;}");
+ gsc_runtime_tick(r,0,10000);RT_CHECK(rt_test_field(r,"done")==-999);gsc_runtime_tick(r,0,10000);RT_CHECK(rt_test_field(r,"done")==1);RT_CHECK(rt_test_field(r,"payload")==42);RT_CHECK(!gsc_runtime_errors(r));gsc_runtime_destroy(r);
+ r=rt_test_runtime("main(){level endon(\"stop\");deep();level.bad=1;}deep(){level waittill(\"go\",n);level.payload=n;wait 1;level.bad=2;}");
+ gsc_runtime_tick(r,0,10000);RT_CHECK(gsc_runtime_notify(r,-1,"go",&arg,1)==1);gsc_runtime_tick(r,1,10000);RT_CHECK(rt_test_field(r,"payload")==42);gsc_runtime_notify(r,-1,"stop",NULL,0);gsc_runtime_tick(r,2000,10000);RT_CHECK(rt_test_field(r,"bad")==-999);RT_CHECK(!gsc_runtime_threads(r));gsc_runtime_destroy(r);
+ r=rt_test_runtime("main(){e=getent(\"door\",\"targetname\");e thread change();wait 0.2;level.count=getentarray(\"door\",\"targetname\").size;}change(){self hide();wait 0.1;self unlinkFromWorld();self show();}");
+ gsc_runtime_tick(r,0,10000);RT_CHECK(rt_test_visible==0 && rt_test_linked==1);gsc_runtime_tick(r,100,10000);RT_CHECK(rt_test_visible==1 && rt_test_linked==0);gsc_runtime_tick(r,200,10000);RT_CHECK(rt_test_field(r,"count")==1);RT_CHECK(!gsc_runtime_errors(r));gsc_runtime_destroy(r);
+ r=rt_test_runtime("main(){lib::pause();level.after=1;}");before=rt_test_reads;gsc_runtime_tick(r,0,10000);RT_CHECK(rt_test_field(r,"after")==-999);gsc_runtime_tick(r,100,10000);RT_CHECK(rt_test_field(r,"far")==9 && rt_test_field(r,"after")==1);RT_CHECK(rt_test_reads==before);RT_CHECK(!gsc_runtime_errors(r));gsc_runtime_destroy(r);
+ r=rt_test_runtime("main(){while(1){level.n=1;}}");RT_CHECK(gsc_runtime_tick(r,0,20)<=20);RT_CHECK(gsc_runtime_threads(r)==1);gsc_runtime_destroy(r);
+ r=rt_test_runtime("main(){thread a();thread b();}a(){level endon(\"both\");level waittill(\"both\");level.bad=1;}b(){level waittill(\"both\",n);level.good=n;}");
+ gsc_runtime_tick(r,0,10000);RT_CHECK(gsc_runtime_notify(r,-1,"both",&arg,1)==1);gsc_runtime_tick(r,0,10000);RT_CHECK(rt_test_field(r,"bad")==-999 && rt_test_field(r,"good")==42);RT_CHECK(!gsc_runtime_errors(r));gsc_runtime_destroy(r);
+ r=rt_test_runtime("main(){e=getent(\"door\");e nested();self.x=8;level.restored=self.x;}nested(){wait 0;self.x=3;level.entity=self.x;}");
+ gsc_runtime_tick(r,0,10000);gsc_runtime_tick(r,1,10000);RT_CHECK(rt_test_field(r,"entity")==3 && rt_test_field(r,"restored")==8);RT_CHECK(!gsc_runtime_errors(r));gsc_runtime_destroy(r);
+ r=rt_test_runtime("main(){thread spin();thread done();}spin(){while(1){level.spin=1;}}done(){level.fair=7;}");
+ for(before=0;before<8;before++)RT_CHECK(gsc_runtime_tick(r,before,100)<=100);
+ RT_CHECK(rt_test_field(r,"fair")==7);RT_CHECK(gsc_runtime_threads(r)==1);gsc_runtime_destroy(r);
+ r=rt_test_runtime("main(){e=getent(\"door\");e.saved=42;for(i=0;i<20000;i++){a=getentarray(\"door\");o=spawnstruct();o.cycle=o;wait 0;}level.saved=getent(\"door\").saved;level.n=i;}");
+ for(before=0;before<20001;before++)gsc_runtime_tick(r,before,1000);
+ RT_CHECK(rt_test_field(r,"n")==20000 && rt_test_field(r,"saved")==42);RT_CHECK(!gsc_runtime_errors(r));RT_CHECK(!gsc_runtime_threads(r));gsc_runtime_destroy(r);
+ printf("rt_test_runtime tests: %d failures\n",rt_test_fails);expect(rt_test_fails==0,"persistent GSC runtime");}
+
+#undef RT_CHECK
+
+static int cb_test_errors,cb_test_visible=1;
+#define CB_CHECK(x) do{if(!(x)){printf("FAIL %d %s\n",__LINE__,#x);cb_test_errors++;}}while(0)
+static void cb_test_err(void* u,const char* s){(void)u;printf("VM %s\n",s);}
+static int cb_test_find(void* u,const char* key,const char* val,int* ids,int cap){(void)u;(void)key;if(!strcmp(val,"door") && cap){ids[0]=7;return 1;}return 0;}
+static int cb_test_state(void* u,int id,int v,int l){(void)u;(void)l;if(id!=7)return 0;if(v>=0)cb_test_visible=v;return 1;}
+static int cb_test_readfile(void* u,const char* p,char** text,size_t* size){const char* s=NULL;(void)u;
+ if(!strcmp(p,"maps/mp/gametypes/_callbacksetup.gsc"))s="CodeCallback_StartGameType(){if(!isDefined(level.gametypestarted) || !level.gametypestarted){[[level.callbackStartGameType]]();level.gametypestarted=true;}}";
+ if(!strcmp(p,"library.gsc"))s="start(n){wait 0.1;level.far=n;}";
+ if(!s)return 0;*size=strlen(s);*text=malloc(*size+1);strcpy(*text,s);return 1;}
+static GscRuntime* cb_test_make(const char* s){GscHost h={0};GscRuntime* r;h.error=cb_test_err;h.read_file=cb_test_readfile;h.entity_find=cb_test_find;h.entity_state=cb_test_state;r=gsc_runtime_create(&h);CB_CHECK(gsc_runtime_start(r,"test.gsc",s,strlen(s),"main",-1));return r;}
+static int cb_test_value(GscRuntime* r,const char* s){int n=-1;gsc_runtime_level_int(r,s,&n);return n;}
+static void test_gsc_start_callbacks(void){GscRuntime* r;
+ r=cb_test_make("main(){level.callbackStartGameType=::start;level.count=0;} start(){level.count=level.count+1;e=getent(\"door\");e hide();wait 2;e show();}");
+ CB_CHECK(gsc_runtime_start_gametype(r));CB_CHECK(gsc_runtime_start_gametype(r));gsc_runtime_tick(r,0,200000);CB_CHECK(cb_test_value(r,"count")==1 && cb_test_visible==0);
+ gsc_runtime_tick(r,1999,10000);CB_CHECK(cb_test_visible==0);gsc_runtime_tick(r,2000,10000);CB_CHECK(cb_test_visible==1 && cb_test_value(r,"gametypestarted")==1);
+ CB_CHECK(gsc_runtime_start_gametype(r));gsc_runtime_tick(r,3000,10000);CB_CHECK(cb_test_value(r,"count")==1);CB_CHECK(!gsc_runtime_errors(r));gsc_runtime_destroy(r);
+ r=cb_test_make("main(){level.callbackStartGameType=::start;level.ready=0;wait 0.5;level.ready=1;}start(){level.seen=level.ready;}");CB_CHECK(gsc_runtime_start_gametype(r));gsc_runtime_tick(r,0,10000);CB_CHECK(cb_test_value(r,"seen")==0);gsc_runtime_tick(r,500,10000);CB_CHECK(cb_test_value(r,"seen")==0 && cb_test_value(r,"ready")==1);CB_CHECK(!gsc_runtime_errors(r));gsc_runtime_destroy(r);
+ r=cb_test_make("main(){f=library::start;[[f]](42);level.after=1;}");gsc_runtime_tick(r,0,10000);CB_CHECK(cb_test_value(r,"after")==-1);gsc_runtime_tick(r,100,10000);CB_CHECK(cb_test_value(r,"far")==42 && cb_test_value(r,"after")==1);CB_CHECK(!gsc_runtime_errors(r));gsc_runtime_destroy(r);
+ r=cb_test_make("main(){f=::check;e=getent(\"door\");e thread [[f]](8);wait 0;level.after=1;}check(n){self.x=n;wait 0;level.self=self.x;}");gsc_runtime_tick(r,0,10000);gsc_runtime_tick(r,1,10000);CB_CHECK(cb_test_value(r,"self")==8 && cb_test_value(r,"after")==1);CB_CHECK(!gsc_runtime_errors(r));gsc_runtime_destroy(r);
+ r=cb_test_make("main(){level.calls=0;a=true || side();b=false && side();c=false || true && !false;level.ok=c;}side(){level.calls=level.calls+1;return 1;}");gsc_runtime_tick(r,0,10000);CB_CHECK(cb_test_value(r,"calls")==0 && cb_test_value(r,"ok")==1);CB_CHECK(!gsc_runtime_errors(r));gsc_runtime_destroy(r);
+ r=cb_test_make("main(){level.sum=4+parent();}parent(){thread child();return 6;}child(){wait 1;}");gsc_runtime_tick(r,0,10000);CB_CHECK(cb_test_value(r,"sum")==10);CB_CHECK(!gsc_runtime_errors(r));gsc_runtime_destroy(r);
+ r=cb_test_make("main(){f=42;[[f]]();level.bad=1;}");gsc_runtime_tick(r,0,10000);CB_CHECK(cb_test_value(r,"bad")==-1);CB_CHECK(gsc_runtime_errors(r)==1);CB_CHECK(!gsc_runtime_threads(r));gsc_runtime_destroy(r);
+ printf("callback tests: %d failures\n",cb_test_errors);expect(cb_test_errors==0,"GSC startup callbacks");}
+
+#undef CB_CHECK
+static void test_native_weapon_catalog(void){
+    int before=checkpoint();CodArchive* ar=cod_archive_create();unsigned char* output=NULL;unsigned size=0,a=0,b=0;
+    const char* raw="WEAPONFILE\\damage\\68\\fireTime\\0.12\\clipSize\\30\\startAmmo\\180\\weaponType\\bullet\\weaponClass\\rifle\\gunModel\\viewmodel_mp44\\idleAnim\\viewmodel_mp44_idle";
+    cod_archive_add_blob(ar,"weapons/mp/mp44_mp",raw,(unsigned)strlen(raw));
+    {const char* grenade="WEAPONFILE\\weaponType\\grenade\\weaponClass\\grenade\\worldModel\\xmodel/weapon_grenade\\projectileModel\\xmodel/projectile_grenade";
+     const char* rocket="WEAPONFILE\\weaponType\\projectile\\weaponClass\\rocketlauncher";
+     cod_archive_add_blob(ar,"weapons/mp/fraggrenade_mp",grenade,(unsigned)strlen(grenade));
+     cod_archive_add_blob(ar,"weapons/mp/panzerfaust_mp",rocket,(unsigned)strlen(rocket));}
+    expect(cod_weapon_catalog(ar,&output,&size),"native catalog exported");
+    expect(output && strstr((char*)output,"name \"mp44_mp\"") && strstr((char*)output,"damage 68") && strstr((char*)output,"startAmmo 180"),"retail fields preserved without heuristic rows");
+    expect(output && strstr((char*)output,"projectile \"xmodel/projectile_grenade\"") && !strstr((char*)output,"xmodel/xmodel/"),"native model prefixes occur exactly once");
+    expect(output && strstr((char*)output,"disposable 1"),"native single-use launcher metadata exported");free(output);
+    expect(cod_weapon_view_exists(ar,"cod/viewhands/mp44_mp/4/profile.txt"),"valid weapon view path");
+    expect(!cod_weapon_view_exists(ar,"cod/viewhands/../4/profile.txt") && !cod_weapon_view_exists(ar,"cod/viewhands/mp44_mp/14/hands.obj"),"invalid variant rejected");
+    expect(cod_weapon_view_checksum(ar,"cod/viewhands/mp44_mp/4/profile.txt",&a),"view dependency checksum");
+    cod_archive_add_blob(ar,"xanim/viewmodel_mp44_idle","change",6);
+    expect(cod_weapon_view_checksum(ar,"cod/viewhands/mp44_mp/4/profile.txt",&b)&&a!=b,"animation replacement invalidates converted view cache");
+    cod_archive_destroy(ar);report("test_native_weapon_catalog",before);
+}
+
+static void test_gsc_lexical_boundaries(void) {
+    int before = checkpoint();
+    const char* source =
+        "/* fake(){return 99;} */\n"
+        "main(){ /* comment with } and // */ return helper(); }\n"
+        "helper(){s=\"} http://host/a /* literal */\"; // }\n"
+        "return 37; }";
+    GscRuntime* r;
+    expect(gsc_vm_exec(source, strlen(source), "main", NULL) == 1,
+           "comments and string braces preserve function boundaries");
+    expect(gsc_vm_last_int == 37, "helper after quoted brace executes");
+    r = cb_test_make("main(){level.url=\"http://host/a\";level.ok=1;}");
+    gsc_runtime_tick(r, 0, 10000);
+    expect(cb_test_value(r, "ok") == 1 && !gsc_runtime_errors(r),
+           "line comment markers inside string preserve following statements");
+    gsc_runtime_destroy(r);
+    r = cb_test_make("main(){level.le=3<=3;level.ge=4>=3;level.ne=2!=3;"
+                     "level.order=0==2<1;level.loop=0;"
+                     "for(i=0;i<=3;i++)level.loop=level.loop+1;"
+                     "level.falsele=4<=3;level.falsene=2!=2;}");
+    gsc_runtime_tick(r, 0, 10000);
+    expect(cb_test_value(r, "le") == 1 && cb_test_value(r, "ge") == 1 &&
+           cb_test_value(r, "ne") == 1 && cb_test_value(r, "order") == 1 &&
+           cb_test_value(r, "loop") == 4 && cb_test_value(r, "falsele") == 0 &&
+           cb_test_value(r, "falsene") == 0 && !gsc_runtime_errors(r),
+           "comparison operators, precedence and inclusive loop bound");
+    gsc_runtime_destroy(r);
+    expect(!gsc_vm_exec("main(){return 1;} /* unterminated",
+                       strlen("main(){return 1;} /* unterminated"), "main", NULL),
+           "unterminated block comment rejects source");
+    report("test_gsc_lexical_boundaries", before);
+}
+
+static void test_gsc_localized_value(void) {
+    int before = checkpoint();
+    GscRuntime* r = cb_test_make("main(){level.token=&\"MENU_TEST\";"
+        "level.same=level.token==&\"MENU_TEST\";level.other=level.token!=&\"MENU_OTHER\";"
+        "level.typed=level.token!=\"MENU_TEST\";thread child(level.token);}"
+        "child(value){wait 0;level.child=value==&\"MENU_TEST\";}");
+    gsc_runtime_tick(r, 0, 10000);
+    gsc_runtime_tick(r, 1, 10000);
+    expect(cb_test_value(r, "same") == 1 && cb_test_value(r, "other") == 1 &&
+           cb_test_value(r, "typed") == 1 && cb_test_value(r, "child") == 1 &&
+           !gsc_runtime_errors(r), "localized keys retain type across fields, threads and waits");
+    gsc_runtime_destroy(r);
+    r = cb_test_make("main(){a=\"prefix\"+4;level.concat=a==\"prefix4\";"
+        "level.numeric=(2+\".\"+5)==\"2.5\";"
+        "level.escape=\"say \\\"hi\\\"\"==\"say \"+\"\\\"hi\\\"\";"
+        "level.path=\"maps\\mp\"==\"maps\"+\"\\mp\";}");
+    gsc_runtime_tick(r, 0, 10000);
+    expect(cb_test_value(r, "concat") == 1 && cb_test_value(r, "numeric") == 1 &&
+           cb_test_value(r, "escape") == 1 && cb_test_value(r, "path") == 1 &&
+           !gsc_runtime_errors(r), "string concatenation, numeric formatting and escaped quotes");
+    gsc_runtime_destroy(r);
+    report("test_gsc_localized_value", before);
+}
+
+static void test_gsc_vector_values(void) {
+    int before = checkpoint();
+    GscRuntime* r = cb_test_make("main(){a=(1,2,3);b=(4,5,6);"
+        "level.add=(a+b)==(5,7,9);level.sub=(b-a)==(3,3,3);"
+        "level.mul=(a*2)==(2,4,6);level.left=(2*a)==(2,4,6);"
+        "level.div=(a/2)==(.5,1,1.5);level.neg=(-a)==(-1,-2,-3);"
+        "level.index=a[1]==2;level.literal=(7,8,9)[2]==9;"
+        "thread child(a);}child(v){wait 0;level.child=v==(1,2,3);}");
+    gsc_runtime_tick(r, 0, 10000);
+    gsc_runtime_tick(r, 1, 10000);
+    expect(cb_test_value(r,"add")==1 && cb_test_value(r,"sub")==1 &&
+           cb_test_value(r,"mul")==1 && cb_test_value(r,"left")==1 &&
+           cb_test_value(r,"div")==1 && cb_test_value(r,"neg")==1 &&
+           cb_test_value(r,"index")==1 && cb_test_value(r,"literal")==1 &&
+           cb_test_value(r,"child")==1 && !gsc_runtime_errors(r),
+           "vector arithmetic, indexing and value lifetime across waits");
+    gsc_runtime_destroy(r);
+    report("test_gsc_vector_values", before);
+}
+
+static void test_gsc_associative_arrays(void) {
+    int before = checkpoint();
+    GscRuntime* r = cb_test_make("main(){a=[];a[9]=7;a[\"9\"]=12;"
+        "level.count=a.size;level.numeric=a[9];level.string=a[\"9\"];"
+        "a[9]=undefined;level.deleted=a.size;"
+        "a[\"9\"]=undefined;level.empty=a.size;"
+        "a[\"spark\"]=spawnstruct();a[\"spark\"].value=42;level.effects=a;"
+        "for(i=0;i<4100;i++)junk=[];wait 0;"
+        "level.gc=level.effects[\"spark\"].value;}");
+    gsc_runtime_tick(r, 0, 200000);
+    gsc_runtime_tick(r, 1, 10000);
+    expect(cb_test_value(r,"count")==2, "mixed sparse array counts defined keys");
+    expect(cb_test_value(r,"numeric")==7 && cb_test_value(r,"string")==12,
+           "numeric and string array keys remain distinct");
+    expect(cb_test_value(r,"deleted")==1 && cb_test_value(r,"empty")==0,
+           "undefined assignment deletes array entries");
+    expect(cb_test_value(r,"gc")==42, "associative values remain GC roots");
+    expect(!gsc_runtime_errors(r), "associative array execution has no diagnostics");
+    gsc_runtime_destroy(r);
+    r = cb_test_make("main(){a=[];a[\"token\"]=42;library::start(a);"
+                     "level.imported=level.far[\"token\"];}");
+    gsc_runtime_tick(r, 0, 10000);
+    gsc_runtime_tick(r, 100, 10000);
+    expect(cb_test_value(r,"imported")==42 && !gsc_runtime_errors(r),
+           "associative values cross imported call and wait");
+    gsc_runtime_destroy(r);
+    report("test_gsc_associative_arrays", before);
+}
+
+static void test_gsc_paths_and_receiver_expressions(void) {
+    int before = checkpoint();
+    GscRuntime* r = cb_test_make("main(){level.data=[];level.data[\"obj\"]=spawnstruct();"
+        "level.data[\"obj\"].value=4;level.data[\"obj\"].value+=2;"
+        "level.data[\"obj\"].value++;level.value=level.data[\"obj\"].value;"
+        "level.test=!(level.data[\"obj\"] check(8));"
+        "level.data[\"obj\"] change(9);level.changed=level.data[\"obj\"].value;"
+        "level.bits=(4|3)^2;level.flag=!(4&2);level.mask=4&6;"
+        "level.fx[\"smoke\"]=13;level.auto=level.fx[\"smoke\"];"
+        "a[1][\"key\"]=17;level.localauto=a[1][\"key\"]; }"
+        "check(n){return self.value==n;}change(n){self.value=n;}");
+    gsc_runtime_tick(r, 0, 200000);
+    expect(cb_test_value(r,"value")==7 && cb_test_value(r,"test")==1 &&
+           cb_test_value(r,"changed")==9 && cb_test_value(r,"bits")==5 &&
+           cb_test_value(r,"flag")==1 && cb_test_value(r,"mask")==4 &&
+           cb_test_value(r,"auto")==13 && cb_test_value(r,"localauto")==17 &&
+           !gsc_runtime_errors(r), "nested assignment, receiver expressions and bitwise masks");
+    gsc_runtime_destroy(r);
+    report("test_gsc_paths_and_receiver_expressions", before);
+}
+
+static int frontend_reads;
+static int frontend_read(void *user, const char *path, char **out, size_t *size) {
+    const char *source = NULL;
+    (void)user;
+    frontend_reads++;
+    if (!strcmp(path, "inc/math.gsc"))
+        source = "#include inc\\common; Add(n){wait 0;return Twice(n)+1;} Set(n){self.value=n;}";
+    if (!strcmp(path, "inc/common.gsc"))
+        source = "Twice(n){return n*2;}";
+    if (!strcmp(path, "inc/other.gsc"))
+        source = "Other(){return 11;}";
+    if (!source)
+        return 0;
+    *size = strlen(source);
+    *out = (char *)malloc(*size + 1);
+    if (!*out)
+        return 0;
+    memcpy(*out, source, *size + 1);
+    return 1;
+}
+static void test_gsc_strict_frontend(void) {
+    int before = checkpoint(), i;
+    GscProg p;
+    GscCompileDiagnostic error;
+    GscRuntime *r;
+    GscHost host = {0};
+    const char *invalid[] = {"main(){return 1}",
+                             "main(){x=(1+);}",
+                             "main(){foo(1,);}",
+                             "main(){break;}",
+                             "main(){continue;}",
+                             "main(){x=1e+;}",
+                             "main(){x=1abc;}",
+                             "main(){nonsense;}",
+                             "main(){x=[];x[0]=;}",
+                             "main(){if(1){}else}",
+                             "main(){switch(1){case 1:break;case 1:break;}}",
+                             "main(){switch(1){default:;default:;}}",
+                             "main(){x=\"unfinished;}",
+                             "main(){/* unfinished}",
+                             "main(a,a){}",
+                             "main(){} MAIN(){}", "if(){}", "main(level){}", "main(){x=else;}"};
+    for (i = 0; i < (int)(sizeof(invalid) / sizeof(invalid[0])); i++) {
+        expect(!gsc_compile_runtime_options(invalid[i], strlen(invalid[i]), &p, NULL, &error),
+               "invalid GSC rejects the entire program");
+        expect(p.ncode == 0 && p.nfunc == 0 && p.code == NULL && error.message[0],
+               "failed GSC emits no executable partial program");
+    }
+    {
+        const char *source = "main(){\n return (1+);\n}";
+        expect(!gsc_compile_runtime_options(source, strlen(source), &p, NULL, &error) &&
+                   error.line == 2 && error.column == 12,
+               "syntax diagnostic identifies exact offending token");
+    }
+    {
+        char *source = (char *)malloc(20000);
+        size_t at = 0;
+        for (i = 0; i < 300; i++)
+            at += (size_t)sprintf(source + at, "func%d(){return %d;}\n", i, i);
+        expect(gsc_compile_runtime_options(source, at, &p, NULL, &error) && p.nfunc == 300,
+               "strict compiler retains all functions beyond former 64-function truncation");
+        gsc_prog_free(&p);
+        free(source);
+    }
+    r = cb_test_make(
+        "main(){i=0;s=0;do{i++;if(i==2)continue;s+=i;}while(i<4);"
+        "switch(i){case 4:s+=10;case 5:s+=2;break;default:s=0;}level.sum=s;"
+        "level.cast=(int)7.9;level.float=((float)3/2)==1.5;level.mod=17%5;"
+        "level.left=3<<4;level.right=-8>>2;level.complement=~0;"
+        "level.once=0;a=[];a[0]=2;a[index()]+=5;level.update=a[0];"
+        "f=::worker;level.ref=[[f]](8); }index(){level.once++;return 0;}worker(string){return string+1;}");
+    gsc_runtime_tick(r, 0, 200000);
+    expect(
+        cb_test_value(r, "sum") == 20 && cb_test_value(r, "cast") == 7 &&
+            cb_test_value(r, "float") == 1 && cb_test_value(r, "mod") == 2 &&
+            cb_test_value(r, "left") == 48 && cb_test_value(r, "right") == -2 &&
+            cb_test_value(r, "complement") == -1 && cb_test_value(r, "once") == 1 &&
+            cb_test_value(r, "update") == 7 && cb_test_value(r, "ref") == 9 &&
+            !gsc_runtime_errors(r),
+        "strict bytecode executes loops, casts, shifts and single-evaluation compound references");
+    gsc_runtime_destroy(r);
+    host.read_file = frontend_read;
+    host.error = cb_test_err;
+    frontend_reads = 0;
+    r = gsc_runtime_create(&host);
+    {
+        const char *source =
+            "#include inc\\math; #include inc/other; Main(){level.result=ADD(20);"
+            "obj=spawnstruct();obj SET(7);level.method=obj.value;f=::Other;level.ref=[[f]]();"
+            "thread done();}done(){level.done=1;}";
+        expect(gsc_runtime_start(r, "test.gsc", source, strlen(source), "MAIN", -1),
+               "included functions link before execution");
+    }
+    i = frontend_reads;
+    gsc_runtime_tick(r, 0, 200000);
+    gsc_runtime_tick(r, 1, 200000);
+    expect(cb_test_value(r, "result") == 41 && cb_test_value(r, "method") == 7 &&
+               cb_test_value(r, "ref") == 11 && cb_test_value(r, "done") == 1 &&
+               !gsc_runtime_errors(r),
+           "transitive includes, receiver calls, references and identifier case execute correctly");
+    expect(frontend_reads == i, "included calls perform no runtime source reads");
+    gsc_runtime_destroy(r);
+    r = gsc_runtime_create(&host);
+    {
+        const char *source = "#include inc\\missing; main(){level.mustnotrun=1;}";
+        expect(!gsc_runtime_start(r, "missing.gsc", source, strlen(source), "main", -1),
+               "missing mandatory include rejects entrypoint");
+        gsc_runtime_tick(r, 0, 10000);
+        expect(cb_test_value(r, "mustnotrun") == -1, "invalid include cannot run partial root");
+    }
+    gsc_runtime_destroy(r);
+    report("test_gsc_strict_frontend", before);
+}
+
+static void test_gsc_frontend_events_and_developer(void) {
+    int before = checkpoint();
+    GscRuntime *r;
+    r = cb_test_make(
+        "main(){o=spawnstruct();o thread listen();wait 0;"
+        "o notify(\"event\",6,\"go\");wait 0;level.early=isDefined(level.matched);"
+        "o notify(\"event\",7,\"go\");wait 0;level.done=1;}"
+        "listen(){self endon(\"stop\");self waittillmatch(\"event\",7,\"go\");level.matched=1;}");
+    gsc_runtime_tick(r, 0, 200000);
+    gsc_runtime_tick(r, 1, 200000);
+    expect(cb_test_value(r, "matched") == -1, "waittillmatch ignores a mismatched payload");
+    gsc_runtime_tick(r, 2, 200000);
+    gsc_runtime_tick(r, 3, 200000);
+    expect(cb_test_value(r, "early") == 0 && cb_test_value(r, "matched") == 1 &&
+               cb_test_value(r, "done") == 1 && !gsc_runtime_errors(r),
+           "struct receiver waittillmatch resumes on matching payload");
+    gsc_runtime_destroy(r);
+    r = cb_test_make("/# hidden(){level.dev=1;} #/ main(){hidden();"
+                     "/# level.inline=1; #/ level.done=1;}");
+    gsc_runtime_tick(r, 0, 10000);
+    expect(cb_test_value(r, "dev") == -1 && cb_test_value(r, "inline") == -1 &&
+               cb_test_value(r, "done") == 1 && !gsc_runtime_errors(r),
+           "disabled developer blocks parse but do not execute");
+    gsc_runtime_destroy(r);
+    r = cb_test_make("#using_animtree(\"tree_a\"); one(){return %idle;}"
+                     "#using_animtree(\"tree_b\");two(){return %idle;}main(){"
+                     "level.distinct=one()!=two();level.same=%idle==%idle;level.other=%idle!=%walk;"
+                     "anim.flag=8;level.global=anim.flag;}");
+    gsc_runtime_tick(r, 0, 10000);
+    expect(cb_test_value(r, "distinct") == 1 && cb_test_value(r, "same") == 1 &&
+               cb_test_value(r, "other") == 1 && cb_test_value(r, "global") == 8 &&
+               !gsc_runtime_errors(r),
+           "animation references preserve per-function tree and anim global");
+    gsc_runtime_destroy(r);
+    r = cb_test_make(
+        "main(){level.phase=1;waittillframeend;level.phase=2;waittillframeend;level.phase=3;}");
+    gsc_runtime_tick(r, 0, 10000);
+    expect(cb_test_value(r, "phase") == 2,
+           "frame-end wait resumes after normal work in the same tick");
+    gsc_runtime_tick(r, 1, 10000);
+    expect(cb_test_value(r, "phase") == 3 && !gsc_runtime_errors(r),
+           "repeated frame-end wait resumes once per tick");
+    gsc_runtime_destroy(r);
+    report("test_gsc_frontend_events_and_developer", before);
+}
+
+
+static void test_declarative_ui_defaults(void) {
+    const char* cfg="bind f +activate\nexec malicious.cfg\nset scr_sd_roundlength 4\nset sv_hostname \"Existing server\"\nset invalid-key 1\nset broken \"unterminated\n";
+    unsigned char* output=NULL;unsigned int size=0;
+    expect(ui_cvar_defaults_from_cfg(cfg,strlen(cfg),&output,&size),"export declarative cfg defaults");
+    if(output){
+        expect(strstr((char*)output,"\"scr_sd_roundlength\" \"4\"")!=NULL,"native gametype value survives");
+        expect(strstr((char*)output,"\"sv_hostname\" \"Existing server\"")!=NULL,"quoted default value survives");
+        expect(!strstr((char*)output,"activate") && !strstr((char*)output,"malicious") && !strstr((char*)output,"invalid-key") && !strstr((char*)output,"broken"),"commands and malformed entries are not executable defaults");
+        free(output);output=NULL;
+    }
+    {
+        const char* menu="menuDef {name fixture itemDef {type ITEM_TYPE_TEXT text Fixture} onOpen {execOnCvarIntValue g_allowvote 0 \"set shown 0\";execOnCvarStringValue g_gametype sd \"set mode 1\";} }";
+        expect(ui_menu_to_helix(menu,strlen(menu),&output,&size),"conditional native menu parses");
+        if(output){expect(strstr((char*)output,"exec_if_int") && strstr((char*)output,"exec_if_string") && strstr((char*)output,"set shown 0") && strstr((char*)output,"set mode 1"),"conditional comparisons retain their command payload");free(output);}
+    }
+}
+
+
+static void test_gametype_catalog(void) {
+    CodArchive* ar=cod_archive_create();unsigned char* out=NULL;unsigned size=0;
+    const char* menu="menuDef { name createserver itemDef { type ITEM_TYPE_MULTI ownerdraw UI_NETGAMETYPE text Game rect 0 0 300 20 } }";
+    const char* loc="REFERENCE TEST_MODE\nLANG_ENGLISH \"Patched mode\"\n";
+    ui_loc_add_str("CATALOG",loc,strlen(loc));
+    cod_archive_add_blob(ar,"maps/mp/gametypes/_teams.gsc","main(){}",8);
+    cod_archive_add_blob(ar,"maps/mp/gametypes/custom.gsc","main(){}",8);
+    cod_archive_add_blob(ar,"maps/mp/gametypes/custom.txt","\"CATALOG_TEST_MODE\"",19);
+    cod_archive_add_blob(ar,"maps/mp/gametypes/bare.gsc","main(){}",8);
+    cod_archive_add_blob(ar,"maps/mp/gametypes/nested/helper.gsc","main(){}",8);
+    cod_archive_add_blob(ar,"maps/mp/gametypes/orphan.txt","orphan",6);
+    ui_menu_set_gametype_archive(ar);
+    expect(ui_menu_to_helix(menu,strlen(menu),&out,&size),"archive gametype menu translates");
+    expect(out && strstr((char*)out,"cvar \"g_gametype\""),"gametype selector is bound");
+    expect(out && strstr((char*)out,"\"custom\" \"Patched mode\""),"gametype localized title");
+    expect(out && strstr((char*)out,"\"bare\" \"bare\""),"missing title falls back to script id");
+    expect(out && !strstr((char*)out,"_teams") && !strstr((char*)out,"helper") && !strstr((char*)out,"orphan"),"shared and nested scripts and orphan title excluded");free(out);out=NULL;
+    cod_archive_add_blob(ar,"maps/mp/gametypes/custom.txt","\"Replacement title\"",19);
+    expect(ui_menu_to_helix(menu,strlen(menu),&out,&size),"catalog rebuild after mount override");
+    expect(out && strstr((char*)out,"Replacement title") && !strstr((char*)out,"Patched mode"),"final archive override wins");free(out);
+    ui_menu_set_gametype_archive(NULL);cod_archive_destroy(ar);
+}
+
+
+static void test_gsc_player_callbacks(void) {
+    const char* script="main(){level.callbackPlayerConnect=::connect;level.callbackPlayerDamage=::damage;}"
+        "connect(){self.value=7;self endon(\"disconnect\");self waittill(\"begin\");level.began=self.value;self waittill(\"menuresponse\",menu,response);level.menu=menu;level.response=response;wait .05;level.finished=self.value;}"
+        "damage(attacker,amount,point){self.value+=amount;level.vector=point[2];level.attacker=attacker;level.damage=amount;}";
+    GscRuntime* r=cb_test_make(script);GscArgument args[3]={{0}},read={0};char response[32]="axis";
+    gsc_runtime_tick(r,0,20000);
+    expect(gsc_runtime_call_level(r,"callbackPlayerConnect",-3,NULL,0),"dispatch actual connect function reference");
+    gsc_runtime_tick(r,0,20000);expect(gsc_runtime_get_entity_value(r,-3,"value",NULL,&read) && read.integer==7,"callback persistent self");
+    expect(gsc_runtime_notify(r,-3,"begin",NULL,0)==1,"begin wakes connect waiter");gsc_runtime_tick(r,0,20000);
+    expect(cb_test_value(r,"began")==7,"begin delivered after connect subscribes");
+    args[0].kind=3;args[0].text="team_menu";args[1].kind=3;args[1].text=response;
+    expect(gsc_runtime_notify(r,-3,"menuresponse",args,2)==1,"menu event wakes player callback");strcpy(response,"changed");gsc_runtime_tick(r,0,20000);
+    expect(gsc_runtime_get_entity_value(r,-1,"response",NULL,&read) && read.kind==3 && !strcmp(read.text,"axis"),"notification copies borrowed payload");
+    args[0].kind=4;args[0].integer=-4;args[1].kind=1;args[1].integer=9;args[2].kind=5;args[2].vector[2]=42;
+    expect(gsc_runtime_call_level(r,"callbackPlayerDamage",-3,args,3),"typed player damage dispatch");gsc_runtime_tick(r,0,20000);
+    expect(cb_test_value(r,"damage")==9 && gsc_runtime_get_entity_value(r,-1,"vector",NULL,&read) && read.kind==2 && read.number==42,"typed damage and vector payload execute");
+    gsc_runtime_tick(r,60,20000);expect(cb_test_value(r,"finished")==16,"callback wait preserves updated player self");
+    expect(gsc_runtime_get_entity_value(r,-1,"attacker",NULL,&read) && read.kind==4 && read.integer==-4,"entity payload identity preserved");
+    expect(!gsc_runtime_call_level(r,"missingCallback",-3,NULL,0),"missing callback is not invented");
+    expect(gsc_runtime_call_level(r,"callbackPlayerConnect",-3,NULL,0),"second subscription starts");gsc_runtime_tick(r,60,20000);
+    gsc_runtime_forget_entity(r,-3);expect(gsc_runtime_threads(r)==0,"disconnect retires waiting player threads");
+    expect(!gsc_runtime_get_entity_value(r,-3,"value",NULL,&read),"reused client entity has fresh script fields");
+    args[0].kind=1;args[0].integer=3;expect(gsc_runtime_set_entity_value(r,-2,"round",NULL,&args[0]),"persistent round set");
+    args[0].kind=3;args[0].text="rifle_mp";expect(gsc_runtime_set_entity_value(r,-3,"pers","weapon",&args[0]),"persistent weapon set");
+    expect(gsc_runtime_reset_map(r),"map restart resets scheduler");
+    expect(gsc_runtime_get_entity_value(r,-2,"round",NULL,&read) && read.integer==3,"round state survives restart");
+    expect(gsc_runtime_get_entity_value(r,-3,"pers","weapon",&read) && read.kind==3 && !strcmp(read.text,"rifle_mp"),"player pers survives restart");
+    expect(!gsc_runtime_get_entity_value(r,-1,"began",NULL,&read),"level state does not survive restart");
+    expect(gsc_runtime_threads(r)==0,"restart cancels every old waiter");
+    expect(gsc_runtime_start(r,"test.gsc",script,strlen(script),"main",-1),"cached script main restarts");gsc_runtime_tick(r,0,20000);
+    expect(gsc_runtime_call_level(r,"callbackPlayerConnect",-3,NULL,0),"callbacks re-register on new level");gsc_runtime_tick(r,0,20000);
+    expect(gsc_runtime_notify(r,-3,"begin",NULL,0)==1,"new level waiter receives begin exactly once");gsc_runtime_tick(r,0,20000);
+    expect(gsc_runtime_errors(r)==0,"lifecycle callbacks have no VM diagnostics");gsc_runtime_destroy(r);
+}
+
+
+static int lifecycle_alias_count;
+static int lifecycle_alias_exists(void* u,const char* name){(void)u;return !strcmp(name,"known_alias");}
+static void lifecycle_precache(void* u,int kind,const char* name){(void)u;if(kind==GSC_PC_SOUND && !strcmp(name,"known_alias"))lifecycle_alias_count++;else expect(0,"unknown literal must not be guessed as sound");}
+static void test_gsc_lifecycle_semantics(void){
+    {
+        GscArgument vector={0},read={0};GscRuntime* event_runtime=rt_test_runtime("main(){level waittill(\"vector\",point);level.vector=point[2];}");
+        gsc_runtime_tick(event_runtime,0,20000);vector.kind=5;vector.vector[2]=42;
+        expect(gsc_runtime_notify(event_runtime,-1,"vector",&vector,1)==1,"native vector notification wakes waiter");gsc_runtime_tick(event_runtime,0,20000);
+        expect(gsc_runtime_get_entity_value(event_runtime,-1,"vector",NULL,&read) && read.kind==2 && read.number==42,"native notification preserves vector payload");gsc_runtime_destroy(event_runtime);
+    }
+
+    GscRuntime* r=rt_test_runtime("main(){level endon(\"stop\");level notify(\"stop\");level.value=1;wait .05;level.value=2;}");
+    gsc_runtime_tick(r,0,20000);expect(rt_test_field(r,"value")==1,"self notify does not terminate current executing stack");
+    gsc_runtime_notify(r,-1,"stop",NULL,0);gsc_runtime_tick(r,50,20000);
+    expect(rt_test_field(r,"value")==2 && !gsc_runtime_errors(r),"self-notified endon subscription is removed before later suspension");gsc_runtime_destroy(r);
+    r=rt_test_runtime("main(){e=getent(\"door\");e.targetname=\"renamed\";level.found=getent(\"renamed\")==e;level.old=isdefined(getent(\"door\"));a=getentarray(\"renamed\");level.count=a.size;}");
+    gsc_runtime_tick(r,0,20000);expect(rt_test_field(r,"found")==1 && rt_test_field(r,"old")==0 && rt_test_field(r,"count")==1,"queries respect runtime property overrides without duplicate native entities");expect(!gsc_runtime_errors(r),"dynamic entity query diagnostics");gsc_runtime_destroy(r);
+    r=rt_test_runtime("main(){level.valid=1;for(i=0;i<1000;i++){n=randomint(4.8);if(n<0 || n>3)level.valid=0;}}");
+    gsc_runtime_tick(r,0,200000);expect(rt_test_field(r,"valid")==1 && !gsc_runtime_errors(r),"stock float-valued spawn scores convert safely for randomInt");gsc_runtime_destroy(r);
+    r=cb_test_make("main(){level.callbackStartGameType=::start;i=0;while(i<200)i++;wait .1;level.later=1;}start(){level.started=1;}");
+    expect(gsc_runtime_start_gametype(r),"startup wrapper request");gsc_runtime_tick(r,0,10);
+    expect(!gsc_runtime_start_dispatched(r),"budget preemption is not a main yield");gsc_runtime_tick(r,0,200000);
+    expect(cb_test_value(r,"started")==1 && gsc_runtime_start_complete(r),"explicit main wait allows startup before main continuation");
+    expect(cb_test_value(r,"later")==-1,"main wait remains suspended during loading");gsc_runtime_tick(r,100,20000);expect(cb_test_value(r,"later")==1,"main continuation resumes after startup");gsc_runtime_destroy(r);
+    {
+        GscHost host={0};const char* source="main(){x=\"not_alias\";}unused(){alias=\"known_alias\";self playLocalSound(alias);}";
+        host.precache=lifecycle_precache;host.sound_alias_exists=lifecycle_alias_exists;r=gsc_runtime_create(&host);lifecycle_alias_count=0;
+        expect(gsc_runtime_start(r,"dependencies.gsc",source,strlen(source),"main",-1),"compile retained alias dependencies");
+        gsc_runtime_precache_dependencies(r);expect(lifecycle_alias_count==1,"alias-indexed variable sound dependency retained");
+        expect(gsc_runtime_reset_map(r),"restart compiled program for dependency registration");gsc_runtime_precache_dependencies(r);
+        expect(lifecycle_alias_count==2,"cached programs re-register map-owned sounds on restart");gsc_runtime_destroy(r);
+    }
+    {
+        GscRuntime* r_solid = rt_test_runtime("main(){e=getent(\"door\");e notsolid();level.unsolid=1;e solid();level.solid=1;}");
+        gsc_runtime_tick(r_solid, 0, 20000);
+        expect(rt_test_field(r_solid, "unsolid") == 1 && rt_test_field(r_solid, "solid") == 1, "entity solid/notsolid toggle succeeds");
+        expect(!gsc_runtime_errors(r_solid), "solid method executes without runtime error");
+        gsc_runtime_destroy(r_solid);
+    }
+}
+
+static void test_generic_native_animation(void){
+    const unsigned char input[]={14,0,2,0,1,0,3,30,0,1,0,0,0,2,0,0,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,160,65,0,0,0,0,0,0,0,0,0,0,99,104,105,108,100,0,1,0,0,0,0,0,0,0,1,0,0,0,0,64,0,0,0,0,0,0,0,0};
+    unsigned char* output=NULL;unsigned size=0;float distance=0;
+    if(!cod_xanim_generic(input,sizeof(input),&output,&size) || size!=232 || memcmp(output,"HXAC1",5)){
+        fprintf(stderr,"FAIL: compressed delta-motion stream export\n");exit(1);
+    }
+    memcpy(&distance,output+24,4);
+    if(distance!=20 || strcmp((char*)output+36,"child")){fprintf(stderr,"FAIL: native delta and channel identity\n");exit(1);}
+    free(output);output=NULL;
+    {unsigned char marked[sizeof(input)+8];memcpy(marked,input,sizeof(input));marked[sizeof(input)]=1;memcpy(marked+sizeof(input)+1,"step",5);marked[sizeof(input)+6]=1;marked[sizeof(input)+7]=0;
+     expect(cod_xanim_generic(marked,sizeof(marked),&output,&size)&&size==300,"native note table and implicit end exported");
+     expect(output && !strcmp((char*)output+168,"step") && !strcmp((char*)output+236,"end"),"native note names retained");free(output);output=NULL;
+     expect(!cod_xanim_generic(marked,sizeof(marked)-1,&output,&size),"truncated note key rejected");}
+    if(cod_xanim_generic(input,sizeof(input)-1,&output,&size)){free(output);fprintf(stderr,"FAIL: truncated native pose accepted\n");exit(1);}
+}
+static void test_animated_shader_material(void) {
+    const char* source="textures/test/flow { { map textures/test/flow.dds tcMod scroll .125 -.25 tcMod rotate 45 tcMod scale 2 3 tcMod turb 0 .03 .5 .25 } }";
+    unsigned char* text=NULL; unsigned size=0;
+    expect(shader_source_to_helix(source,strlen(source),&text,&size),"animated shader converts");
+    expect(text && strstr((char*)text,"uvScroll 0.125 -0.25"),"scroll parameters exported");
+    expect(text && strstr((char*)text,"uvRotate 45"),"rotation exported");
+    expect(text && strstr((char*)text,"uvTransform 2 0 0 3 0 0"),"scale uses native transform order");
+    expect(text && strstr((char*)text,"uvTurb 0 "),"turbulence exported");
+    free(text);
+}
+
+static void test_footstep_alias_variants(void){
+    int before=checkpoint();unsigned char* out=NULL;unsigned int size=0;
+    const char* csv="name,sequence,file,vol_min,vol_max,pitch_min,pitch_max,dist_min,dist_max,channel\n"
+      "step_run_wood,1,footsteps/wood1.wav,.2,.5,.9,1.1,50,1000,body\n"
+      "step_run_wood,2,footsteps/wood2.wav,.2,.5,.9,1.1,50,1000,body\n";
+    expect(sound_csv_to_helix(csv,strlen(csv),&out,&size),"step CSV translates");
+    expect(out && strstr((char*)out,"step_run_wood__variant_1") && strstr((char*)out,"step_run_wood__variant_2"),"all step samples addressable");
+    expect(out && strstr((char*)out,"spatial 1") && strstr((char*)out,"max_dist 1000"),"step distance retained");
+    free(out);out=NULL;
+    csv="name,sequence,file,vol_min,vol_max,pitch_min,pitch_max,dist_min,dist_max,channel\n"
+        "german_follow_me,1,voice/follow.wav,.8,1,1,1,80,5000,voice\n";
+    expect(sound_csv_to_helix(csv,strlen(csv),&out,&size),"spoken voice CSV translates");
+    expect(out && strstr((char*)out,"spatial 1") && strstr((char*)out,"max_dist 900"),"spoken radio uses bounded world attenuation");
+    free(out);report("test_footstep_alias_variants",before);
+}
+static void test_vote_menu_conversion(void) {
+    int before=checkpoint();unsigned char* output=NULL;unsigned int size=0;
+    const char* menu="{ menuDef { name callvote onOpen {uiScript loadArenas;} "
+        "itemDef {name vote type ITEM_TYPE_BUTTON visible 1 cvarTest allow disableCvar {\"0\"} action {uiScript voteMap;}} "
+        "itemDef {name type visible 1 ownerdraw UI_NETGAMETYPE} "
+        "itemDef {name players type ITEM_TYPE_LISTBOX visible 1 feeder FEEDER_PLAYER_LIST} "
+        "itemDef {name kick type ITEM_TYPE_BUTTON visible 1 action {uiScript voteKick;}} "
+        "itemDef {name ban type ITEM_TYPE_BUTTON visible 1 action {uiScript voteTempBan;}} "
+        "itemDef {name mode type ITEM_TYPE_BUTTON visible 1 action {uiScript voteTypeMap;}} }}";
+    expect(ui_menu_to_helix(menu,strlen(menu),&output,&size),"stock vote operations convert");
+    if(output){const char* text=(const char*)output;
+        expect(strstr(text,"stackGroup cod_session")!=NULL,"session tabs share exclusive group");
+        expect(strstr(text,"ui_vote map") && strstr(text,"ui_vote typemap") && strstr(text,"ui_vote clientkick") && strstr(text,"ui_vote tempbanuser"),"every stock vote submission reaches host command");
+        expect(strstr(text,"ui_vote_player") && strstr(text,"players"),"kick list uses stable player-id feeder");
+        expect(strstr(text,"ui_vote_gametype")!=NULL,"vote gametype selection cannot change live server rules");
+        expect(strstr(text,"disableCvar")!=NULL,"vote permissions preserve disabled choices");
+        free(output);
+    }
+    report("test_vote_menu_conversion",before);
 }
 
 int main(void) {
+    test_footstep_alias_variants();
+    test_animated_shader_material();
+    test_generic_native_animation();
+    test_declarative_ui_defaults();
+    test_gsc_frontend_events_and_developer();
+    test_gsc_strict_frontend();
+    test_gsc_paths_and_receiver_expressions();
+    test_gsc_associative_arrays();
+    test_gsc_vector_values();
+    test_gsc_localized_value();
+    test_gsc_lexical_boundaries();
+    test_hud_and_quickmenu_bridge();
+    test_native_game_menu_layout();
+    test_sound_csv_native_preamble();
     test_plugin_create();
     test_archive_blob();
     test_bsp_names_and_header();
     test_fence_monsterclip_is_drawn();
     test_terrain_collision();
-    test_foliage_clip_is_a_top();
+    test_foliage_clip_is_nonsolid();
+    test_brush_contents_and_ladder();
     test_xmodel_through_archive();
     test_xmodel_v14_lod();
     test_view_basis_rigid();
@@ -2747,8 +3609,22 @@ int main(void) {
     test_xanim();
     test_sound_ui_gsc();
     test_texture_shader_menu();
+    test_opaque_window_base_stage();
+    test_initial_script_brushmodels();
+    test_native_spawn_metadata();
+    test_skybox_shader_metadata();
+    test_native_vertex_blend_weights();
+    test_stance_modes_and_hud();
+    test_native_lightmap_image();
+    test_gametype_catalog();
+    test_use_hint_menu();
     test_plugin_bsp_open();
     test_cvar_menu_and_cache();
+    test_gsc_lifecycle_semantics();
+    test_gsc_player_callbacks();
+    test_gsc_start_callbacks();
+    test_gsc_runtime();
+    test_vote_menu_conversion();
     test_gsc_vm();
     test_gsc_vm_fib();
     test_gsc_vm_array();
@@ -2757,6 +3633,9 @@ int main(void) {
     test_gsc_vm_cullfog();
     test_gsc_vm_funcref();
     test_gsc_vm_float();
+    test_gsc_precache_host();
+    test_native_dependency_descriptors();
+    test_native_weapon_catalog();
     if (g_fail) {
         fprintf(stderr, "%d check(s) failed\n", g_fail);
         return 1;

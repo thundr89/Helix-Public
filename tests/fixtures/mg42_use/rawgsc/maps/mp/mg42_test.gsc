@@ -1,0 +1,1 @@
+main(){t=getent("misc_mg42","classname");t waittill("activated",actor);setcvar("mg42_test_activated",isdefined(actor));t waittill("deactivated");setcvar("mg42_test_deactivated",1);}

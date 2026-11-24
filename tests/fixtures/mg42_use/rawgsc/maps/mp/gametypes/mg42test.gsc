@@ -1,0 +1,1 @@
+main(){level.callbackStartGameType=::started;} started(){}

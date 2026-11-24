@@ -11,18 +11,20 @@
  * "cod" and the DLL is hxfs_cod. The game's gameinfo loads this plugin.
  */
 
-#include "iasset_plugin.h"
+#include "helix/fs/iasset_plugin.h"
 #include "archive/archive.h"
 #include "bsp/names.h"
 #include "bsp/read.h"
 #include "bsp/helix.h"
 #include "xmodel/helix.h"
+#include "xmodel/read.h"
 #include "xanim/helix.h"
 #include "sound/helix.h"
 #include "ui/helix.h"
 #include "gsc/helix.h"
-#include "texture/helix.h"
 #include "shader/helix.h"
+#include "shader/read.h"
+#include "bot/cod_nav.h"
 #include "cache.h"
 #include "emit.h"
 #include "cod_util.h"
@@ -30,6 +32,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 #if defined(_WIN32)
 #define HXFS_EXPORT __declspec(dllexport)
@@ -203,6 +206,9 @@ static int cod_open_dir(hxAssetPlugin* self, const char* dir_path) {
     cod_archive_clear(p->archive);
     if (!dir_path || !dir_path[0]) return 0;
 
+    /* The host mounts plain zip/pk3/iwd on its own search paths. This directory
+     * is the CoD tree: the plugin still opens *.pk3 so it can translate bsp,
+     * menus, xmodels and gsc. Image bytes are returned unchanged. */
 #ifdef _WIN32
     {
         WIN32_FIND_DATAA fd;
@@ -304,24 +310,12 @@ static int texture_alt_exists(const CodArchive* ar, const char* name) {
 
 static int texture_source(const CodArchive* ar, const char* name, unsigned char** raw, unsigned int* rsz) {
     char alt[512];
+    /* Exact names stay as stored. A renamed request prefers DDS: the engine decodes it. */
     if (cod_archive_read(ar, name, raw, rsz)) return 1;
-    if (with_ext(name, ".tga", alt, sizeof(alt)) && cod_archive_read(ar, alt, raw, rsz)) return 1;
     if (with_ext(name, ".dds", alt, sizeof(alt)) && cod_archive_read(ar, alt, raw, rsz)) return 1;
+    if (with_ext(name, ".tga", alt, sizeof(alt)) && cod_archive_read(ar, alt, raw, rsz)) return 1;
     if (with_ext(name, ".jpg", alt, sizeof(alt)) && cod_archive_read(ar, alt, raw, rsz)) return 1;
     return 0;
-}
-
-static int texture_checksum(const CodArchive* ar, const char* name, unsigned int* crc) {
-    char alt[512];
-    if (cod_archive_checksum(ar, name, crc)) return 1;
-    if (with_ext(name, ".tga", alt, sizeof(alt)) && cod_archive_checksum(ar, alt, crc)) return 1;
-    if (with_ext(name, ".dds", alt, sizeof(alt)) && cod_archive_checksum(ar, alt, crc)) return 1;
-    if (with_ext(name, ".jpg", alt, sizeof(alt)) && cod_archive_checksum(ar, alt, crc)) return 1;
-    return 0;
-}
-
-static int is_dds(const unsigned char* p, unsigned n) {
-    return n >= 4 && p[0] == 'D' && p[1] == 'D' && p[2] == 'S' && p[3] == ' ';
 }
 
 static int cache_dir(char* out, size_t cap) {
@@ -548,13 +542,167 @@ static int weapons_text(const CodArchive* ar, unsigned char** out_buf, unsigned 
     return 1;
 }
 
+
+/* Virtual generic dependency lists. Native WEAPONFILE/EFX parsing stays here. */
+static int dependency_source(const char* name, char* source, size_t cap) {
+    size_t n;
+    if (!name || !ends_ci(name, ".hxprecache")) return 0;
+    n = strlen(name) - strlen(".hxprecache");
+    if (!n || n >= cap) return 0;
+    memcpy(source, name, n); source[n] = '\0';
+    return starts_ci(source, "weapons/mp/") || (starts_ci(source, "fx/") && ends_ci(source, ".efx"));
+}
+static int dependency_emit(CodEmit* out, const char* kind, const char* name) {
+    const char* c; char piece[3];
+    if (!name || !name[0] || strcmp(name, "none") == 0) return 1;
+    if (!cod_emit_fmt(out, "%s \"", kind)) return 0;
+    for (c = name; *c; ++c) {
+        if ((unsigned char)*c < 32) return 0;
+        if (*c == '"' || *c == '\\') { piece[0] = '\\'; piece[1] = *c; piece[2] = 0; }
+        else { piece[0] = *c; piece[1] = 0; }
+        if (!cod_emit_add(out, piece)) return 0;
+    }
+    return cod_emit_add(out, "\"\n");
+}
+static int dependency_asset(CodEmit* out, const char* kind, const char* value) {
+    char path[512];
+    if (!value || !value[0] || strcmp(value, "none") == 0) return 1;
+    if (strcmp(kind, "model") == 0 && !starts_ci(value,"xmodel/") && !starts_ci(value,"models/"))
+        snprintf(path,sizeof(path),"xmodel/%s",value);
+    else if (strcmp(kind, "weapon") == 0 && !starts_ci(value,"weapons/"))
+        snprintf(path,sizeof(path),"weapons/mp/%s",value);
+    else if (strcmp(kind, "fx") == 0)
+        snprintf(path,sizeof(path),"%s%s%s",starts_ci(value,"fx/")?"":"fx/",value,ends_ci(value,".efx")?"":".efx");
+    else snprintf(path,sizeof(path),"%s",value);
+    return dependency_emit(out,kind,path);
+}
+static char* dependency_token(char* cursor, char* token, size_t cap) {
+    size_t n=0; int quote;
+    while (*cursor && isspace((unsigned char)*cursor)) ++cursor;
+    if (!*cursor) { token[0]=0;return cursor; }
+    quote=*cursor=='"'; if (quote) ++cursor;
+    if (!quote && (*cursor=='[' || *cursor==']' || *cursor=='{' || *cursor=='}')) {
+        token[0]=*cursor++;token[1]=0;return cursor;
+    }
+    while (*cursor && (quote ? *cursor!='"' : !isspace((unsigned char)*cursor) && *cursor!='[' && *cursor!=']' && *cursor!='{' && *cursor!='}')) {
+        if (n+1<cap) token[n++]=*cursor;
+        ++cursor;
+    }
+    if (quote && *cursor=='"') ++cursor;
+    token[n]=0;return cursor;
+}
+static int dependency_text(const CodArchive* archive, const char* name, unsigned char** output, unsigned* size) {
+    char source[512], *text, *cursor; unsigned char* raw=NULL; unsigned length=0; CodEmit out; int ok=1;
+    if (!dependency_source(name,source,sizeof(source)) || !cod_archive_read(archive,source,&raw,&length)) return 0;
+    text=(char*)malloc((size_t)length+1);
+    if (!text) { free(raw);return 0; }
+    memcpy(text,raw,length);text[length]=0;free(raw);
+    if (!cod_emit_init(&out)) { free(text);return 0; }
+    ok=dependency_emit(&out,"source",source);
+    if (starts_ci(source,"weapons/")) {
+        cursor=strchr(text,'\\'); if (cursor) ++cursor;
+        while (ok && cursor && *cursor) {
+            char* key=cursor; char* split=strchr(key,'\\'); char* value; char* next; char path[512];
+            if (!split) break; *split=0;value=split+1;next=strchr(value,'\\');if (next) *next=0;
+            cursor=next?next+1:NULL;
+            if (ends_ci(key,"Model")) ok=dependency_asset(&out,"model",value);
+            else if (ends_ci(key,"Sound")) ok=dependency_asset(&out,"sound",value);
+            else if (ends_ci(key,"Shader") || strcmp(key,"hudIcon")==0 || strcmp(key,"ammoCounterIcon")==0) ok=dependency_asset(&out,"shader",value);
+            else if (ends_ci(key,"Effect")) ok=dependency_asset(&out,"fx",value);
+            else if (ends_ci(key,"Anim") && value[0]) { snprintf(path,sizeof(path),"xanim/%s",value);ok=dependency_asset(&out,"data",path); }
+            else if (strcmp(key,"altWeapon")==0) ok=dependency_asset(&out,"weapon",value);
+        }
+    } else {
+        char token[512];cursor=text;
+        while (ok && *cursor) {
+            const char* kind=NULL;
+            cursor=dependency_token(cursor,token,sizeof(token));
+            if (strcmp(token,"shaders")==0) kind="shader";
+            else if (strcmp(token,"models")==0) kind="model";
+            else if (strcmp(token,"sounds")==0) kind="sound";
+            else if (strcmp(token,"effects")==0) kind="fx";
+            if (!kind) continue;
+            cursor=dependency_token(cursor,token,sizeof(token));if (strcmp(token,"[")!=0) continue;
+            while (ok && *cursor) {
+                cursor=dependency_token(cursor,token,sizeof(token));if (strcmp(token,"]")==0) break;
+                ok=dependency_asset(&out,kind,token);
+            }
+        }
+    }
+    free(text);
+    if (ok) ok=cod_emit_take(&out,output,size);
+    if (!ok) cod_emit_free(&out);
+    return ok;
+}
+
+/* Virtual lossless lightmap images. Only requested during map preparation. */
+static int lightmap_read(CodPlugin* p,const char* name,unsigned char** output,unsigned int* output_size) {
+    char map[128],path[256],cands[3][256];int index,n,i;const char* slash;
+    if(!starts_ci(name,"codlightmaps/"))return 0;
+    slash=strchr(name+13,'/');if(!slash || slash==name+13 || slash-(name+13)>=sizeof(map))return 0;
+    memcpy(map,name+13,slash-(name+13));map[slash-(name+13)]=0;
+    {char* end;long value=strtol(slash+1,&end,10);if(value<0 || value>32767 || strcmp(end,".tga"))return 0;index=(int)value;}
+    snprintf(path,sizeof(path),"maps/%s.hxmap",map);n=bsp_candidate_paths(path,cands,3,NULL,0);
+    for(i=0;i<n;i++){
+        unsigned char* bsp=NULL;unsigned int size=0,length,offset;size_t bytes=512u*512u*3u,k;
+        if(!cod_archive_read(p->archive,cands[i],&bsp,&size))continue;
+        if(!bsp_read_valid(bsp,size)){free(bsp);continue;}
+        memcpy(&length,bsp+16,4);memcpy(&offset,bsp+20,4);
+        if(offset>size || length>size-offset || length%bytes || (size_t)index>=length/bytes){free(bsp);return 0;}
+        if(!output){free(bsp);return 1;}
+        *output=(unsigned char*)calloc(1,18+bytes);if(!*output){free(bsp);return 0;}*output_size=(unsigned int)(18+bytes);
+        (*output)[2]=2;(*output)[13]=2;(*output)[15]=2;(*output)[16]=24;(*output)[17]=32;
+        for(k=0;k<bytes;k+=3){const unsigned char* s=bsp+offset+(size_t)index*bytes+k;int r=s[0]*2,g=s[1]*2,b=s[2]*2,max=r>g?r:g;if(b>max)max=b;
+            if(max>255){r=r*255/max;g=g*255/max;b=b*255/max;}
+            (*output)[18+k]=(unsigned char)b;(*output)[19+k]=(unsigned char)g;(*output)[20+k]=(unsigned char)r;}
+        free(bsp);return 1;
+    }
+    return 0;
+}
+
+static void append_sun_profile(CodPlugin* p,unsigned char** bytes,unsigned int* size) {
+    const char* marker=strstr((const char*)*bytes,"\"sun_profile\" \"");char profile[128],path[256];size_t n=0;
+    unsigned char* raw=NULL;unsigned int length=0;CodEmit extra;char* text;char* cursor;
+    if(!marker)return;marker+=strlen("\"sun_profile\" \"");while(*marker && *marker!='"' && n+1<sizeof(profile))profile[n++]=*marker++;profile[n]=0;
+    if(!n || strstr(profile,".."))return;snprintf(path,sizeof(path),"scripts/%s.sun",profile);
+    if(!cod_archive_read(p->archive,path,&raw,&length))return;
+    text=(char*)malloc(length+1);if(!text){free(raw);return;}memcpy(text,raw,length);text[length]=0;free(raw);
+    if(!cod_emit_init(&extra)){free(text);return;}
+    cod_emit_add(&extra,"\nentity {\n \"classname\" \"environment_sun\"\n \"runtime_only\" \"1\"\n");cursor=text;
+    while(*cursor){char key[128],value[256];cursor=dependency_token(cursor,key,sizeof(key));cursor=dependency_token(cursor,value,sizeof(value));
+        if(!strncmp(key,"r_",2))cod_emit_fmt(&extra," \"%s\" \"%s\"\n",key+2,value);}
+    cod_emit_add(&extra,"}\n");free(text);
+    {unsigned char* grown=(unsigned char*)realloc(*bytes,*size+extra.len+1);if(grown){memcpy(grown+*size,extra.data,extra.len+1);*bytes=grown;*size+=(unsigned int)extra.len;}}
+    cod_emit_free(&extra);
+}
+
 static int cod_contains(hxAssetPlugin* self, const char* name) {
     CodPlugin* p = (CodPlugin*)self;
     char cands[3][256];
     int n, i;
     if (!p || !p->archive || !name) return 0;
+    {size_t len=strlen(name);if(starts_ci(name,"xmodel/") && len>7 && len<300 && !strncmp(name+len-7,".hxlod",6) && name[len-1]>='1' && name[len-1]<='3'){
+        char model[300];unsigned crc;memcpy(model,name,len-7);model[len-7]=0;return cod_archive_checksum(p->archive,model,&crc);
+    }}
+    if(cod_bot_virtual_exists(name))return 1;
+    if (!strcmp(name,"ui/cvars.hxdefaults")) return 1;
+    if(!strncmp(name,"cod/animations/",15)){
+        char path[256];size_t n=strlen(name+15);if(n<5 || n>180 || strcmp(name+strlen(name)-4,".hxa"))return 0;
+        snprintf(path,sizeof(path),"xanim/%.*s",(int)n-4,name+15);return cod_archive_contains(p->archive,path);
+    }
+    if (!strcmp(name,"cod/arsenal.txt")) return 1;
+    if (starts_ci(name,"cod/viewhands/")) return cod_weapon_view_exists(p->archive,name);
+    if(starts_ci(name,"codlightmaps/"))return lightmap_read(p,name,NULL,NULL);
+    if(starts_ci(name,"xmodel/") && ends_ci(name,".hxtags")) {
+        char model[256];size_t n=strlen(name)-7;if(n>=sizeof(model))return 0;memcpy(model,name,n);model[n]=0;return cod_archive_contains(p->archive,model);
+    }
+    if (ends_ci(name,".hxprecache")) {
+        char source[512];return dependency_source(name,source,sizeof(source)) && cod_archive_contains(p->archive,source);
+    }
     if (sp_sound_table(name) || sp_menu(name) || sp_gsc(name)) return 0;
+    if (strcmp(name, "ui/gameplay.hxmenu") == 0 || strcmp(name, "ui/voices.hxvoice") == 0 || strcmp(name,"ui/strings.hxloc")==0) return 1;
     if (strcmp(name, "cod/weapons.txt") == 0) return 1;
+    if (cod_strcasecmp(name, "ui/menus.txt") == 0) return cod_archive_contains(p->archive, "ui_mp/menus.txt");
     if (strcmp(name, "cod/viewhand.txt") == 0) {
         unsigned char* buf = NULL;
         unsigned sz = 0;
@@ -617,6 +765,12 @@ static void ensure_menu_loc(CodPlugin* p) {
         unsigned char* raw = NULL;
         unsigned int rsz = 0;
         unsigned crc = 0;
+        if(n && starts_ci(n,"maps/mp/gametypes/") && (ends_ci(n,".gsc") || ends_ci(n,".txt"))) {
+            const unsigned char* ch=(const unsigned char*)n;unsigned fingerprint=2166136261u;
+            while(*ch){fingerprint^=(unsigned char)tolower(*ch++);fingerprint*=16777619u;}
+            if(cod_archive_checksum(ar,n,&crc))fingerprint^=crc;
+            p->loc_crc^=fingerprint;
+        }
         if (!n || !strstr(n, "localizedstrings/") || !ends_ci(n, ".str")) continue;
         base = strrchr(n, '/');
         if (!base) base = strrchr(n, '\\');
@@ -634,6 +788,35 @@ static void ensure_menu_loc(CodPlugin* p) {
     free(names);
 }
 
+static int voice_definitions(unsigned char** out_buf, unsigned int* out_size) {
+    CodEmit e;
+    if (!cod_emit_init(&e)) return 0;
+    { const char* text = ui_loc_find("QUICKMESSAGE_1_FOLLOW_ME"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickcommands 1 follow_me \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_2_MOVE_IN"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickcommands 2 move_in \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_3_FALL_BACK"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickcommands 3 fall_back \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_4_SUPPRESSING_FIRE"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickcommands 4 suppressing_fire \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_5_SQUAD_ATTACK_LEFT_FLANK"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickcommands 5 attack_left_flank \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_6_SQUAD_ATTACK_RIGHT_FLANK"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickcommands 6 attack_right_flank \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_7_SQUAD_HOLD_THIS_POSITION"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickcommands 7 hold_position \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_8_SQUAD_REGROUP"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickcommands 8 regroup \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_1_ENEMY_SPOTTED"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickstatements 1 enemy_spotted \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_2_ENEMY_DOWN"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickstatements 2 enemy_down \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_3_IM_IN_POSITION"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickstatements 3 in_position \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_4_AREA_SECURE"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickstatements 4 area_secure \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_5_GRENADE"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickstatements 5 grenade \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_6_SNIPER"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickstatements 6 sniper \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_7_NEED_REINFORCEMENTS"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickstatements 7 need_reinforcements \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_8_HOLD_YOUR_FIRE"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickstatements 8 hold_fire \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_1_YES_SIR"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickresponses 1 yes_sir \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_2_NO_SIR"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickresponses 2 no_sir \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_3_ON_MY_WAY"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickresponses 3 on_my_way \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_4_SORRY"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickresponses 4 sorry \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_5_GREAT_SHOT"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickresponses 5 great_shot \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_6_TOOK_LONG_ENOUGH"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickresponses 6 took_long_enough \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    { const char* text = ui_loc_find("QUICKMESSAGE_7_ARE_YOU_CRAZY"); if (text) { while (*text && (*text == ' ' || *text == '.' || (*text >= '0' && *text <= '9'))) text++; if (!cod_emit_fmt(&e, "voice quickresponses 7 youre_crazy \"%s\"\n", text)) { cod_emit_free(&e); return 0; } } }
+    return cod_emit_take(&e, out_buf, out_size);
+}
+
 static int cod_read(hxAssetPlugin* self, const char* name,
                     unsigned char** out_buf, unsigned int* out_size) {
     CodPlugin* p = (CodPlugin*)self;
@@ -641,8 +824,74 @@ static int cod_read(hxAssetPlugin* self, const char* name,
     unsigned char* raw = NULL;
     unsigned int rsz = 0;
     if (!p || !p->archive || !name || !out_buf || !out_size) return 0;
+    if(cod_bot_virtual_exists(name))return cod_bot_virtual_read(name,out_buf,out_size);
+    if (!strcmp(name,"ui/cvars.hxdefaults")) {
+        int ok;cod_archive_read(p->archive,"default_mp.cfg",&raw,&rsz);
+        ok=ui_cvar_defaults_from_cfg(raw,rsz,out_buf,out_size);free(raw);return ok;
+    }
+    if(!strncmp(name,"cod/animations/",15)){
+        char source[256];size_t n=strlen(name+15);unsigned char* raw=NULL;unsigned bytes=0,crc=0;int ok;
+        if(n<5 || n>180 || strcmp(name+strlen(name)-4,".hxa") || strchr(name+15,'/') || strchr(name+15,'\\') || strstr(name+15,".."))return 0;
+        snprintf(source,sizeof(source),"xanim/%.*s",(int)n-4,name+15);
+        if(!cod_archive_checksum(p->archive,source,&crc))return 0;crc^=0x414E4D35u;
+        if(cache_try(name,crc,out_buf,out_size))return 1;
+        if(!cod_archive_read(p->archive,source,&raw,&bytes))return 0;
+        ok=cod_xanim_generic(raw,bytes,out_buf,out_size);free(raw);
+        if(ok)cache_save(name,crc,*out_buf,*out_size);return ok;
+    }
+    if (!strcmp(name,"cod/arsenal.txt")) return cod_weapon_catalog(p->archive,out_buf,out_size);
+    if (starts_ci(name,"cod/viewhands/")) {
+        unsigned crc=0;int have=cod_weapon_view_checksum(p->archive,name,&crc);
+        if(have && cache_try(name,crc,out_buf,out_size))return 1;
+        if(!cod_weapon_view_file(p->archive,name,out_buf,out_size))return 0;
+        if(have)cache_save(name,crc,*out_buf,*out_size);return 1;
+    }
+    if(starts_ci(name,"codlightmaps/"))return lightmap_read(p,name,out_buf,out_size);
+    if (starts_ci(name,"xmodel/") && ends_ci(name,".hxtags")) {
+        char model[256];size_t n=strlen(name)-7;
+        if(n>=sizeof(model))return 0;memcpy(model,name,n);model[n]=0;
+        return cod_model_tags(p->archive,model,out_buf,out_size);
+    }
+    if (ends_ci(name,".hxprecache")) return dependency_text(p->archive,name,out_buf,out_size);
     if (sp_sound_table(name) || sp_menu(name) || sp_gsc(name)) return 0;
+    if (strcmp(name,"ui/strings.hxloc")==0) {ensure_menu_loc(p);return ui_loc_export(out_buf,out_size);}
+    if (strcmp(name, "ui/voices.hxvoice") == 0) { ensure_menu_loc(p); return voice_definitions(out_buf, out_size); }
+    if (strcmp(name, "ui/gameplay.hxmenu") == 0) {
+        static const char text[] =
+            "menuDef { name \"matchtimer\" hud 1 visible 1 itemDef { type label rect 270 450 100 25 cvar \"ui_match_timer\" textalign center textHeight 18 } }\n"
+            "menuDef { name \"vote_hud\" hud 1 visible 1 spectatorMode 1 itemDef {type label rect 129 18 382 26 cvar \"ui_vote_text\" textHeight 11 textWrap 1} itemDef {type label rect 129 44 382 16 cvar \"ui_vote_status\" textHeight 11} }\n"
+            "menuDef { name \"aiming\" hud 1 visible 1 itemDef { name \"crosshair\" type crosshair rect 320 240 0 0 cvar \"ui_crosshair_spread\" cvarTest \"ui_health\" hideCvar \"0\" } }\n"
+            "menuDef { name \"spectator\" hud 1 visible 1 spectatorMode 2 rect 0 0 640 480\n"
+            " itemDef { type image rect 64 375 512 32 background \"gfx/hud/hud@mpflag_spectator.dds\" cvarTest \"ui_spectator_hud\" showCvar \"1\" }\n"
+            " itemDef { type label rect 120 382 400 20 text \"@CGAME_SPECTATOR\" textHeight 16 textalign center forecolor 1 1 1 1 cvarTest \"ui_spectator_hud\" showCvar \"1\" }\n"
+            " itemDef { type label rect 120 405 400 18 cvar \"ui_spectator_name\" prefix \"@CGAME_FOLLOWING \" textHeight 13 textalign center cvarTest \"ui_spectator_hud\" showCvar \"1\" cvarTest2 \"ui_spectator_following\" showCvar2 \"1\" }\n"
+            " itemDef { type label rect 16 430 608 14 cvar \"ui_spectator_next_text\" textHeight 11 textalign center forecolor .8 .8 .75 1 cvarTest \"ui_spectator_hud\" showCvar \"1\" cvarTest2 \"ui_spectator_follow_allowed\" showCvar2 \"1\" }\n"
+            " itemDef { type label rect 16 445 608 14 cvar \"ui_spectator_previous_text\" textHeight 11 textalign center forecolor .8 .8 .75 1 cvarTest \"ui_spectator_hud\" showCvar \"1\" cvarTest2 \"ui_spectator_follow_allowed\" showCvar2 \"1\" }\n"
+            " itemDef { type label rect 16 460 608 14 cvar \"ui_spectator_stop_text\" textHeight 11 textalign center forecolor .8 .8 .75 1 cvarTest \"ui_spectator_hud\" showCvar \"1\" cvarTest2 \"ui_spectator_free_allowed\" showCvar2 \"1\" }\n"
+            "}\n"
+            "menuDef { name \"scoreboard\" hud 1 visible 0 spectatorMode 1 rect 129 52 382 380 backcolor 0 0 0 0\n"
+            " itemDef { type label rect 0 0 382 24 cvar \"ui_scoreboard_gametype\" textHeight 16 forecolor 1 1 1 1 }\n"
+            " itemDef { type label rect 0 24 382 16 cvar \"ui_map_title\" textHeight 13 forecolor .8 .8 .75 1 }\n"
+            " itemDef { type label rect 0 42 382 16 cvar \"ui_hostname\" textHeight 11 forecolor .7 .7 .65 1 }\n"
+            " itemDef { type label rect 0 62 382 1 backcolor 1 1 1 .25 }\n"
+            " itemDef { type label rect 175.72 66 61.12 14 text \"@CGAME_SB_SCORE\" textHeight 12 textalign right }\n"
+            " itemDef { type label rect 236.84 66 76.4 14 text \"@CGAME_SB_DEATHS\" textHeight 12 textalign right }\n"
+            " itemDef { type label rect 313.24 66 68.76 14 text \"@CGAME_SB_PING\" textHeight 12 textalign right }\n"
+            " itemDef { name \"scores\" type listbox rect 0 80 382 294 feeder \"scores\" tableColumns 4 175.72 61.12 76.4 68.76 rowHeight 14 headingHeight 24 decoration 1 textHeight 12 backcolor 0 0 0 0 focuscolor .6 .6 .45 .22 }\n"
+            " itemDef { type label rect 0 379 382 1 backcolor 1 1 1 .25 }\n"
+            "}\n"
+            ;
+        *out_size = sizeof(text) - 1; *out_buf = (unsigned char*)malloc(sizeof(text));
+        if (!*out_buf) return 0; memcpy(*out_buf, text, sizeof(text)); return 1;
+    }
     if (strcmp(name, "cod/weapons.txt") == 0) return weapons_text(p->archive, out_buf, out_size);
+    if (cod_strcasecmp(name, "ui/menus.txt") == 0) {
+        int ok = 0;
+        if (!cod_archive_read(p->archive, "ui_mp/menus.txt", &raw, &rsz)) return 0;
+        ok = menus_txt_to_helix(p->archive, raw, rsz, out_buf, out_size);
+        free(raw);
+        return ok;
+    }
     if (strcmp(name, "cod/viewhand.txt") == 0)
         return cod_viewhand_file(p->archive, out_buf, out_size);
     if (menu_music_alias(name) && !cod_archive_contains(p->archive, name)) {
@@ -657,10 +906,17 @@ static int cod_read(hxAssetPlugin* self, const char* name,
     }
     len = strlen(name);
 
+    if(starts_ci(name,"xmodel/") && len>7 && len<300 && len>=7 && !strncmp(name+len-7,".hxlod",6) && name[len-1]>='1' && name[len-1]<='3'){
+        char model[300];size_t base=len-7;
+        memcpy(model,name,base);model[base]=0;
+        return xmodel_lod_to_helix(p->archive,model,name[len-1]-'0',out_buf,out_size);
+    }
+
     if (strncmp(name, "xmodel/", 7) == 0 && name[7] &&
         !strchr(name + 7, '/') && !strchr(name + 7, '\\')) {
         unsigned crc = 0;
         int have = cod_archive_checksum(p->archive, name, &crc);
+        crc^=0x52494734u; /* Bind-pose named attachment transforms. */
         if (have && cache_try(name, crc, out_buf, out_size)) return 1;
         if (!xmodel_to_helix(p->archive, name, out_buf, out_size)) return 0;
         if (have) cache_save(name, crc, *out_buf, *out_size);
@@ -686,13 +942,20 @@ static int cod_read(hxAssetPlugin* self, const char* name,
             unsigned char* bsp = NULL;
             unsigned int bsz = 0;
             if (!cod_archive_checksum(p->archive, cands[i], &crc)) continue;
+            {unsigned int sky_crc=0;if(cod_archive_checksum(p->archive,"scripts/sky.shader",&sky_crc))crc^=(sky_crc<<1)|(sky_crc>>31);}
+            {char** paths=NULL;unsigned int count=0,k;cod_archive_list(p->archive,&paths,&count);
+             for(k=0;k<count;k++){unsigned int dependency=0;if(ends_ci(paths[k],".sun") && cod_archive_checksum(p->archive,paths[k],&dependency))crc^=dependency;free(paths[k]);}free(paths);}
+            crc ^= 0x2026101cu; /* Trigger ownership + ZBot AAS navigation areas/reachabilities. */
             if (cache_try(name, crc, out_buf, out_size)) {
                 note_map_body(p->archive, mname);
                 return 1;
             }
+            {unsigned char* sky=NULL;unsigned int size=0;
+             if(cod_archive_read(p->archive,"scripts/sky.shader",&sky,&size)){CodShaderFile file;if(shader_read(sky,size,&file)){shader_note_invisible(&file);shader_read_free(&file);}free(sky);}}
             if (!cod_archive_read(p->archive, cands[i], &bsp, &bsz)) continue;
             if (bsp_to_helix(bsp, bsz, mname, out_buf, out_size)) {
                 free(bsp);
+                append_sun_profile(p,out_buf,out_size);
                 cache_save(name, crc, *out_buf, *out_size);
                 note_map_body(p->archive, mname);
                 return 1;
@@ -707,10 +970,13 @@ static int cod_read(hxAssetPlugin* self, const char* name,
         ensure_menu_loc(p);
         have = cod_archive_checksum(p->archive, name, &crc);
         if (have) crc ^= p->loc_crc;
+        crc ^= 0x55494e5Au; /* Session groups, editable fields and complete vote menu actions. */
         if (have && cache_try(name, crc, out_buf, out_size)) return 1;
         if (!cod_archive_read(p->archive, name, &raw, &rsz)) return 0;
+        ui_menu_set_gametype_archive(p->archive);
         ui_menu_set_include(menu_include, (void*)p->archive);
         ok = ui_menu_to_helix(raw, rsz, out_buf, out_size);
+        ui_menu_set_gametype_archive(NULL);
         free(raw);
         if (ok && have) cache_save(name, crc, *out_buf, *out_size);
         return ok;
@@ -741,6 +1007,7 @@ static int cod_read(hxAssetPlugin* self, const char* name,
         unsigned crc = 0;
         int ok = 0;
         int have = cod_archive_checksum(p->archive, name, &crc);
+        crc ^= 0x55564131u; /* Animated UV material conversion, revision 1. */
         if (have && cache_try(name, crc, out_buf, out_size)) return 1;
         if (!cod_archive_read(p->archive, name, &raw, &rsz)) return 0;
         ok = shader_source_to_helix(raw, rsz, out_buf, out_size);
@@ -748,26 +1015,13 @@ static int cod_read(hxAssetPlugin* self, const char* name,
         if (ok && have) cache_save(name, crc, *out_buf, *out_size);
         return ok;
     }
-    if (ends_ci(name, ".png") || ends_ci(name, ".tga") || ends_ci(name, ".dds") ||
+    if (ends_ci(name, ".png") || ends_ci(name, ".tga") || ends_ci(name, ".dds") || ends_ci(name, ".jpg") ||
         texture_alt_exists(p->archive, name)) {
-        unsigned crc = 0;
-        int ok = 0;
-        int have = texture_checksum(p->archive, name, &crc);
+        /* PNG, TGA, JPG and DDS stay compressed or raw. The host decodes them. */
         if (!texture_source(p->archive, name, &raw, &rsz)) return 0;
-        /* stb_image reads PNG and TGA. DDS still goes through the converter. */
-        if (!is_dds(raw, rsz)) {
-            *out_buf = raw;
-            *out_size = rsz;
-            return 1;
-        }
-        if (have && cache_try(name, crc, out_buf, out_size)) {
-            free(raw);
-            return 1;
-        }
-        ok = texture_to_png(raw, rsz, out_buf, out_size);
-        free(raw);
-        if (ok && have) cache_save(name, crc, *out_buf, *out_size);
-        return ok;
+        *out_buf = raw;
+        *out_size = rsz;
+        return 1;
     }
     return cod_archive_read(p->archive, name, out_buf, out_size);
 }

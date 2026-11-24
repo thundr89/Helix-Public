@@ -22,8 +22,11 @@
 
 /* Mixed into the sidecar so a translator change does not reuse an old body.
  * The .cache file itself is the translation, with no binary header. */
-/* 23: tcMod transform on the deck flag, and perlight add is not the base blend. */
-#define COD_CACHE_REV 23u
+/* 24: materials keep the source image extension; DDS is not rewritten to PNG. */
+/* 35: native visibility, wrapped text, game menu navigation and HUD layout. */
+/* 47: preserve native lightmap indices/UVs and map-authored sun profiles. */
+/* 59: expose all platform-supported renderer modules in converted settings. */
+#define COD_CACHE_REV 69u
 
 static unsigned int cache_key(unsigned int checksum) {
     return checksum ^ (0xC0D00000u + COD_CACHE_REV);
@@ -146,3 +149,4 @@ void cod_cache_store(const char* dir, const char* key, unsigned int checksum,
     }
     fclose(f);
 }
+

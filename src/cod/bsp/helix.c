@@ -13,6 +13,7 @@
 #include "bsp/helix.h"
 #include "bsp/read.h"
 #include "shader/helix.h"
+#include "bot/cod_nav.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -81,7 +82,7 @@ typedef struct {
 
 typedef struct {
     unsigned short material_id;
-    unsigned short draw_order;
+    short lightmap_index;
     int            vertex_offset;
     unsigned short vertex_count;
     unsigned short triangle_count; // Number of indices in MeshVerts
@@ -314,7 +315,7 @@ static void transpose_grid(float* grid, float* scratch, int* width, int* height)
 /* Downward authored faces are the walkable side in CoD. Helix thickens along -normal,
  * so the stored normal has to point up or the slab floats above the ground. */
 static int append_terrain_tri(StringBuilder* sb, int* opened, unsigned int* base,
-                              const char* contents, const float a[3], const float b_in[3], const float c_in[3]) {
+                              const char* contents, const float a[3], const float b_in[3], const float c_in[3], unsigned int surface_flags) {
     float b[3], c[3];
     float e1x, e1y, e1z, e2x, e2y, e2z, nx, ny, nz, len2, inv;
     memcpy(b, b_in, sizeof(b));
@@ -339,6 +340,7 @@ static int append_terrain_tri(StringBuilder* sb, int* opened, unsigned int* base
         sb_append(sb, "mesh {\n");
         sb_append(sb, "  material \"textures/common/clip\"\n");
         sb_append_f(sb, "  contents %s\n", contents);
+        sb_append_f(sb,"  surfaceFlags %d\n",(int)surface_flags);
         *opened = 1;
         *base = 0;
     }
@@ -445,8 +447,8 @@ static void emit_terrain_collision(StringBuilder* sb, const unsigned char* bytes
                     memcpy(p10, grid_at(grid, x + 1, y), sizeof(p10));
                     memcpy(p11, grid_at(grid, x + 1, y + 1), sizeof(p11));
                     memcpy(p01, grid_at(grid, x, y + 1), sizeof(p01));
-                    append_terrain_tri(sb, &opened, &base, contents, p00, p10, p11);
-                    append_terrain_tri(sb, &opened, &base, contents, p00, p11, p01);
+                    append_terrain_tri(sb, &opened, &base, contents, p00, p10, p11, materials[shader].flags);
+                    append_terrain_tri(sb, &opened, &base, contents, p00, p11, p01, materials[shader].flags);
                 }
             }
         } else if (indices) {
@@ -469,13 +471,29 @@ static void emit_terrain_collision(StringBuilder* sb, const unsigned char* bytes
                     !read_disk_vert(verts, vert_n, first_vert + (unsigned int)i2, c)) {
                     continue;
                 }
-                append_terrain_tri(sb, &opened, &base, contents, a, b, c);
+                append_terrain_tri(sb, &opened, &base, contents, a, b, c, materials[shader].flags);
             }
         }
         if (opened) sb_append(sb, "}\n\n");
     }
     free(grid);
     free(scratch);
+}
+
+static int model_owner(const CoD1Model* models,unsigned int count,unsigned int index,int surface) {
+    unsigned int i;
+    for(i=0;i<count;i++) {
+        int first=surface?models[i].first_surf:models[i].first_brush;
+        int n=surface?models[i].num_surfs:models[i].num_brushes;
+        if(first>=0 && n>0 && index>=(unsigned int)first && index-(unsigned int)first<(unsigned int)n)return (int)i;
+    }
+    return 0;
+}
+static void model_tags(StringBuilder* sb,const CoD1Model* models,const unsigned char* visible,const unsigned char* linked,unsigned int count,unsigned int index,int surface) {
+    int owner=model_owner(models,count,index,surface);
+    int vis=owner==0 || visible[owner];
+    int lnk=owner==0 || (linked ? linked[owner] : visible[owner]);
+    sb_append_f(sb,"  model %d\n  visible %d\n  linked %d\n",owner,vis,lnk);
 }
 
 int bsp_to_helix(const void* data, size_t size, const char* map_name,
@@ -487,12 +505,38 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
     float min_world[3] = {  999999.f,  999999.f,  999999.f };
     float max_world[3] = { -999999.f, -999999.f, -999999.f };
     int spawn_count = 0;
+    unsigned int model_count = 0;
+    const CoD1Model* models = NULL;
+    unsigned char* visible_models = NULL;
+    unsigned char* linked_models = NULL;
+    unsigned char* trigger_models = NULL;
+    float* model_origins = NULL;
+    CodNavBuilder nav_builder;
 
     if (!cod_bsp_is_valid(data, size)) return 0;
     if (!parse_lumps(bytes, size, lumps)) return 0;
 
     sb_init(&sb);
     if (!sb.data) return 0;
+    cod_nav_init(&nav_builder);
+
+    if (span_ok(size, lumps[LUMP_MODELS].offset, lumps[LUMP_MODELS].length)) {
+        model_count = lumps[LUMP_MODELS].length / sizeof(CoD1Model);
+        models = (const CoD1Model*)(bytes + lumps[LUMP_MODELS].offset);
+    }
+    if (model_count) {
+        visible_models = (unsigned char*)calloc(model_count, 1);
+        linked_models = (unsigned char*)calloc(model_count, 1);
+        trigger_models = (unsigned char*)calloc(model_count, 1);
+        model_origins = (float*)calloc(model_count * 3, sizeof(float));
+        if (!visible_models || !linked_models || !trigger_models || !model_origins) {
+            free(visible_models); free(linked_models); free(trigger_models); free(model_origins);
+            cod_nav_free(&nav_builder);
+            free(sb.data); return 0;
+        }
+        visible_models[0] = 1;
+        linked_models[0] = 1;
+    }
 
     sb_append(&sb, "map {\n");
     sb_append(&sb, "  version 1\n");
@@ -510,6 +554,7 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
             while (p < end && isspace((unsigned char)*p)) p++;
             if (p >= end) break;
             if (*p == '{') {
+                const char* entity_start=p+1;const char* entity_end;
                 char classname[128] = {0};
                 char origin[128] = {0};
                 char angle[32] = {0};
@@ -548,7 +593,33 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
                         strncpy(modelscale, val, sizeof(modelscale)-1);
                     }
                 }
+                entity_end=p;
                 if (p < end && *p == '}') p++;
+
+                /* Retail exploder replacements are initially hidden. Keep the
+                 * intact script brush models, including roofs and their clips. */
+                if (model[0] == '*') {
+                    char* tail;
+                    long index = strtol(model + 1, &tail, 10);
+                    if (*tail == '\0' && index > 0 && (unsigned long)index < model_count) {
+                        float mox = 0.f, moy = 0.f, moz = 0.f;
+                        if (origin[0] && sscanf(origin, "%f %f %f", &mox, &moy, &moz) == 3) {
+                            model_origins[index * 3 + 0] = mox;
+                            model_origins[index * 3 + 1] = moy;
+                            model_origins[index * 3 + 2] = moz;
+                        }
+                        if (visible_models && strcmp(classname, "script_brushmodel") == 0 &&
+                            strcmp(targetname, "exploder") != 0 &&
+                            strcmp(targetname, "exploderchunk") != 0 &&
+                            !origin[0] && !angles[0] && !angle[0]) {
+                            visible_models[index] = 1;
+                            linked_models[index] = 1;
+                        } else if (linked_models && strncmp(classname, "trigger_", 8) == 0) {
+                            linked_models[index] = 1;
+                            trigger_models[index] = 1;
+                        }
+                    }
+                }
 
                 /* Map CoD classnames to Helix entity classes */
                 if (classname[0]) {
@@ -579,11 +650,25 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
                         spawn_count++;
                     }
 
+                    if (origin[0] && (strcmp(mapped_class, "info_player_deathmatch") == 0 ||
+                                      strcmp(mapped_class, "info_player_start") == 0 ||
+                                      strcmp(classname, "trigger_use") == 0 ||
+                                      strcmp(classname, "misc_mg42") == 0 ||
+                                      strncmp(classname, "mpweapon_", 9) == 0 ||
+                                      strstr(targetname, "bomb") != NULL ||
+                                      strstr(targetname, "radio") != NULL ||
+                                      strstr(targetname, "obj") != NULL)) {
+                        { float nav_o[3] = { ox, oy, oz }; cod_nav_add_anchor_point(&nav_builder, nav_o, 0); }
+                    }
+
                     /* Emit player spawn entity */
                     if (strcmp(mapped_class, "info_player_deathmatch") == 0 ||
                         strcmp(mapped_class, "info_player_start") == 0) {
                         sb_append(&sb, "entity {\n");
                         sb_append_f(&sb, "  \"classname\" \"%s\"\n", mapped_class);
+                        sb_append_f(&sb, "  \"cod_classname\" \"%s\"\n", classname);
+                        sb_append(&sb,"  \"spawn_anchor\" \"1\"\n");
+                        if(origin[0])sb_append_f(&sb,"  \"cod_origin\" \"%s\"\n",origin);
                         if (origin[0]) {
                             float ox = 0.f, oy = 0.f, oz = 0.f;
                             if (sscanf(origin, "%f %f %f", &ox, &oy, &oz) == 3) {
@@ -599,23 +684,58 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
                         sb_append(&sb, "}\n\n");
                     }
 
-                    /* Static world props. Brush models ("*0") stay in the BSP soup. */
-                    if ((strcmp(classname, "misc_model") == 0 || strcmp(classname, "script_model") == 0) &&
-                        model[0] && model[0] != '*') {
-                        /* Skip invisible particle emitters and duplicate destroyed model variants */
-                        if (strcmp(model, "xmodel/fx") == 0 ||
-                            (targetname[0] && strstr(targetname, "exploder") != NULL)) {
-                            /* Invisible particle fx anchor or duplicate destroyed model */
-                        } else {
-                            sb_append(&sb, "entity {\n");
-                            sb_append(&sb, "  \"classname\" \"misc_model\"\n");
-                            sb_append_f(&sb, "  \"model\" \"%s\"\n", model);
-                            if (origin[0]) sb_append_f(&sb, "  \"origin\" \"%s\"\n", origin);
-                            if (angles[0]) sb_append_f(&sb, "  \"angles\" \"%s\"\n", angles);
-                            else if (angle[0]) sb_append_f(&sb, "  \"angle\" \"%s\"\n", angle);
-                            if (modelscale[0]) sb_append_f(&sb, "  \"modelscale\" \"%s\"\n", modelscale);
-                            sb_append(&sb, "}\n\n");
+                    /* Preserve native spawn arguments for runtime getent/getentarray.
+                     * Player spawn translation above remains the engine spawn source. */
+                    if(strcmp(mapped_class,"info_player_deathmatch")!=0 && strcmp(mapped_class,"info_player_start")!=0) {
+                        const char* q=entity_start;
+                        int is_intermission = strstr(classname,"intermission")!=NULL;
+                        int is_target = strcmp(classname,"info_null")==0 || strcmp(classname,"info_notnull")==0;
+                        sb_append(&sb,"entity {\n");
+                        sb_append_f(&sb,"  \"runtime_only\" \"%d\"\n", (is_intermission || is_target) ? 0 : 1);
+                        if(is_intermission) {
+                            sb_append(&sb,"  \"spawn_anchor\" \"1\"\n");
+                            if(origin[0])sb_append_f(&sb,"  \"cod_origin\" \"%s\"\n",origin);
                         }
+                        if((strcmp(classname,"script_model")==0 || strcmp(classname,"misc_mg42")==0) && model[0] && model[0]!='*' && strcmp(model,"xmodel/fx")!=0)
+                            sb_append(&sb,"  \"render_model\" \"1\"\n");
+                        while(q && q<entity_end) {
+                            q=parse_token(q,entity_end,key,sizeof(key));if(!q || q>=entity_end)break;
+                            q=parse_token(q,entity_end,val,sizeof(val));if(!q)break;
+                            /* CoD stores sun RGB as a hue, including legacy 0..255 values. */
+                            if(!strcmp(classname,"worldspawn") && (!strcmp(key,"suncolor") || !strcmp(key,"sundiffusecolor"))){
+                                float r,g,b;if(sscanf(val,"%f %f %f",&r,&g,&b)==3){
+                                    float peak=fmaxf(r,fmaxf(g,b));
+                                    if(isfinite(peak) && peak>0.f){snprintf(val,sizeof(val),"%.9g %.9g %.9g",r/peak,g/peak,b/peak);}
+                                }
+                            }
+                            sb_append_f(&sb,"  \"%s\" \"%s\"\n",key,val);
+                            if(!strcmp(key,"lightingPrecalc")){
+                                float r,g,b;if(sscanf(val,"%f %f %f",&r,&g,&b)==3){
+                                    float peak;r*=2;g*=2;b*=2;peak=fmaxf(1.f,fmaxf(r,fmaxf(g,b)));
+                                    if(r==0.f && g==0.f && b==0.f)
+                                        sb_append(&sb,"  \"lightingColor\" \"-1 -1 -1\"\n"); /* Missing baked sample: use runtime lighting. */
+                                    else
+                                    sb_append_f(&sb,"  \"lightingColor\" \"%.9g %.9g %.9g\"\n",r/peak,g/peak,b/peak);
+                                }
+                            }
+                        }
+                        if(!strncmp(classname,"mpweapon_",9)){
+                            const char* w=classname+9;
+                            if(!strcmp(w,"kar98ksniper"))w="kar98k_sniper";
+                            if(!strcmp(w,"mosinnagant"))w="mosin_nagant";
+                            if(!strcmp(w,"mosinnagantsniper"))w="mosin_nagant_sniper";
+                            sb_append_f(&sb,"  \"classname\" \"item_weapon_native\"\n  \"cod_classname\" \"%s\"\n  \"weapon\" \"%s_mp\"\n  \"runtime_only\" \"0\"\n",classname,w);
+                            sb_append(&sb,"  \"drop_to_floor\" \"1\"\n");
+                        }
+                        if(model[0]=='*') {
+                            int id=atoi(model+1);
+                            int vis=id>0 && (unsigned int)id<model_count && visible_models[id];
+                            int lnk=id>0 && (unsigned int)id<model_count && linked_models[id];
+                            sb_append_f(&sb,"  \"visible\" \"%d\"\n  \"linked\" \"%d\"\n",vis,lnk);
+                        } else if(strcmp(model,"xmodel/fx")==0 || strstr(targetname,"exploder")) {
+                            sb_append(&sb,"  \"visible\" \"0\"\n");
+                        }
+                        sb_append(&sb,"}\n\n");
                     }
                 }
             } else {
@@ -632,6 +752,7 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
         sb_append(&sb, "}\n\n");
         min_world[0] = -256.f; min_world[1] = -256.f; min_world[2] = 0.f;
         max_world[0] =  256.f; max_world[1] =  256.f; max_world[2] = 128.f;
+        { float nav_o[3] = { 0.f, 0.f, 0.f }; cod_nav_add_anchor_point(&nav_builder, nav_o, 0); }
     }
 
     /* 2. Parse Brushes (Lump 4), BrushSides (Lump 3), Planes (Lump 2), Materials (Lump 0) */
@@ -646,22 +767,19 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
         materials = (const CoDMaterial*)(bytes + lumps[LUMP_MATERIALS].offset);
     }
 
+    if(materials){unsigned int i;const char* suffix[]={"rt","lf","bk","ft","up","dn"};
+        for(i=0;i<num_materials;i++){const char* base=shader_skybox(materials[i].name);int j;if(!base[0])continue;
+            sb_append(&sb,"entity {\n  \"classname\" \"environment_skybox\"\n  \"runtime_only\" \"1\"\n");
+            for(j=0;j<6;j++)sb_append_f(&sb,"  \"face_%s\" \"%s_%s\"\n",suffix[j],base,suffix[j]);
+            if(shader_sunfile(materials[i].name)[0])sb_append_f(&sb,"  \"sun_profile\" \"%s\"\n",shader_sunfile(materials[i].name));
+            sb_append(&sb,"}\n");break;
+        }
+    }
+
     if (lumps[LUMP_BRUSHES].length > 0 &&
         lumps[LUMP_BRUSHSIDES].length > 0) {
 
         unsigned int num_brushes = lumps[LUMP_BRUSHES].length / sizeof(CoD1Brush);
-        unsigned int brush_begin = 0;
-        unsigned int brush_end = num_brushes;
-        if (lumps[LUMP_MODELS].length >= sizeof(CoD1Model)) {
-            const CoD1Model* world_model = (const CoD1Model*)(bytes + lumps[LUMP_MODELS].offset);
-            /* World model only. Submodel brushes (script_brushmodel doors) stay out. */
-            if (world_model->num_brushes > 0) {
-                brush_begin = (unsigned int)world_model->first_brush;
-                brush_end = brush_begin + (unsigned int)world_model->num_brushes;
-                if (brush_begin > num_brushes) brush_begin = 0;
-                if (brush_end > num_brushes) brush_end = num_brushes;
-            }
-        }
         const CoD1Brush* brushes = (const CoD1Brush*)(bytes + lumps[LUMP_BRUSHES].offset);
 
         unsigned int num_brushsides = lumps[LUMP_BRUSHSIDES].length / sizeof(CoD1BrushSide);
@@ -673,10 +791,7 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
         unsigned int side_idx = 0;
         unsigned int b;
 
-        for (b = 0; b < brush_begin && b < num_brushes; b++) {
-            side_idx += brushes[b].sides;
-        }
-        for (b = brush_begin; b < brush_end; b++) {
+        for (b = 0; b < num_brushes; b++) {
             const CoD1Brush* brush = &brushes[b];
             unsigned int num_sides = brush->sides;
 
@@ -685,6 +800,7 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
             if (num_sides >= 6) {
                 const char* mat_name = "textures/dev/wall";
                 unsigned int cflags = 0;
+                int owner = model_owner(models, model_count, b, 0);
                 if (materials && brush->material_id < num_materials) {
                     if (materials[brush->material_id].name[0]) {
                         mat_name = materials[brush->material_id].name;
@@ -698,16 +814,23 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
                                    strstr(mat_name, "clipweap") != NULL ||
                                    strstr(mat_name, "bulletclip") != NULL ||
                                    strstr(mat_name, "clipshot") != NULL);
-                /* clipfoliage is a bush volume: CoD marks it nonsolid. The top stays
-                 * landable; the sides must not be a wall. Straight hedges are clip. */
+                /* clipfoliage has no hard player collision. Straight hedges use clip. */
                 int is_foliage_clip = strstr(mat_name, "clipfoliage") != NULL;
-                int is_playerclip = !is_weapclip && !is_foliage_clip &&
-                                    (strstr(mat_name, "playerclip") != NULL ||
+                int is_trigger = (strstr(mat_name, "trigger") != NULL || (cflags & 0x40000000) != 0 ||
+                                  (owner > 0 && trigger_models && trigger_models[owner]));
+                int is_playerclip = !is_weapclip && !is_foliage_clip && !is_trigger &&
+                                    ((cflags & 0x10000u) != 0 ||
+                                     strstr(mat_name, "playerclip") != NULL ||
                                      (strstr(mat_name, "clip") != NULL &&
                                       strstr(mat_name, "monster") == NULL &&
                                       strstr(mat_name, "shot") == NULL));
-                int is_trigger = (strstr(mat_name, "trigger") != NULL || (cflags & 0x40000000) != 0);
+                int is_ladder = strstr(mat_name, "ladder") != NULL ||
+                                (materials && brush->material_id < num_materials &&
+                                 (materials[brush->material_id].flags & 0x8u) != 0);
+                int is_shotclip = !is_playerclip && !is_ladder && !is_trigger && (cflags & 0x2080u) != 0;
                 int is_tool = (is_weapclip ||
+                               (materials && (cflags & 0x10001u) == 0 && !is_trigger && !is_shotclip &&
+                                strstr(mat_name, "water") == NULL) ||
                                strstr(mat_name, "portal") != NULL ||
                                strstr(mat_name, "sky") != NULL ||
                                strstr(mat_name, "origin") != NULL ||
@@ -722,32 +845,11 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
                                strstr(mat_name, "spawner_trigger") != NULL ||
                                strstr(mat_name, "occluder") != NULL);
 
-                if (is_foliage_clip) {
-                    float d0 = brushsides[side_idx + 0].column1.dist;
-                    float d1 = brushsides[side_idx + 1].column1.dist;
-                    float d2 = brushsides[side_idx + 2].column1.dist;
-                    float d3 = brushsides[side_idx + 3].column1.dist;
-                    float d4 = brushsides[side_idx + 4].column1.dist;
-                    float d5 = brushsides[side_idx + 5].column1.dist;
-                    float min_x = (d0 < d1) ? d0 : d1;
-                    float max_x = (d0 < d1) ? d1 : d0;
-                    float min_y = (d2 < d3) ? d2 : d3;
-                    float max_y = (d2 < d3) ? d3 : d2;
-                    float min_z = (d4 < d5) ? d4 : d5;
-                    float max_z = (d4 < d5) ? d5 : d4;
-                    if ((max_x - min_x) >= 0.1f && (max_y - min_y) >= 0.1f && (max_z - min_z) >= 0.1f) {
-                        sb_append(&sb, "mesh {\n");
-                        sb_append(&sb, "  material \"textures/common/clip\"\n");
-                        sb_append(&sb, "  contents solid\n");
-                        sb_append_f(&sb, "  v %.1f %.1f %.1f 0.0000 0.0000 0.00 0.00 1.00\n", min_x, min_y, max_z);
-                        sb_append_f(&sb, "  v %.1f %.1f %.1f 0.0000 0.0000 0.00 0.00 1.00\n", max_x, min_y, max_z);
-                        sb_append_f(&sb, "  v %.1f %.1f %.1f 0.0000 0.0000 0.00 0.00 1.00\n", max_x, max_y, max_z);
-                        sb_append_f(&sb, "  v %.1f %.1f %.1f 0.0000 0.0000 0.00 0.00 1.00\n", min_x, max_y, max_z);
-                        sb_append(&sb, "  f 0 1 2\n");
-                        sb_append(&sb, "  f 0 2 3\n");
-                        sb_append(&sb, "}\n\n");
-                    }
-                } else if (window_mat(mat_name) && name_has(mat_name, "glass")) {
+                /* Entity trigger hulls remain queryable even with skip/notsolid tools. */
+                if(is_trigger)is_tool=0;
+                if (!is_trigger && is_foliage_clip) {
+                    /* Foliage volumes do not create hard player collision, including tops. */
+                } else if (!is_trigger && window_mat(mat_name) && name_has(mat_name, "glass")) {
                     /* The pane fills the crouch opening. The wall brushes around it stay. */
                 } else if (!is_tool) {
                     float d0 = brushsides[side_idx + 0].column1.dist;
@@ -756,17 +858,22 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
                     float d3 = brushsides[side_idx + 3].column1.dist;
                     float d4 = brushsides[side_idx + 4].column1.dist;
                     float d5 = brushsides[side_idx + 5].column1.dist;
+                    float ox = (owner > 0 && model_origins) ? model_origins[owner * 3 + 0] : 0.f;
+                    float oy = (owner > 0 && model_origins) ? model_origins[owner * 3 + 1] : 0.f;
+                    float oz = (owner > 0 && model_origins) ? model_origins[owner * 3 + 2] : 0.f;
 
-                    float min_x = (d0 < d1) ? d0 : d1;
-                    float max_x = (d0 < d1) ? d1 : d0;
-                    float min_y = (d2 < d3) ? d2 : d3;
-                    float max_y = (d2 < d3) ? d3 : d2;
-                    float min_z = (d4 < d5) ? d4 : d5;
-                    float max_z = (d4 < d5) ? d5 : d4;
+                    float min_x = ((d0 < d1) ? d0 : d1) + ox;
+                    float max_x = ((d0 < d1) ? d1 : d0) + ox;
+                    float min_y = ((d2 < d3) ? d2 : d3) + oy;
+                    float max_y = ((d2 < d3) ? d3 : d2) + oy;
+                    float min_z = ((d4 < d5) ? d4 : d5) + oz;
+                    float max_z = ((d4 < d5) ? d5 : d4) + oz;
 
                     /* Skip degenerate zero-volume brushes */
                     if ((max_x - min_x) >= 0.1f && (max_y - min_y) >= 0.1f && (max_z - min_z) >= 0.1f) {
                         sb_append(&sb, "brush {\n");
+                        sb_append_f(&sb,"  surfaceFlags %d\n",materials && brush->material_id<num_materials?(int)materials[brush->material_id].flags:0);
+                        model_tags(&sb,models,visible_models,linked_models,model_count,b,0);
                         sb_append_f(&sb, "  mins %.1f %.1f %.1f\n", min_x, min_y, min_z);
                         sb_append_f(&sb, "  maxs %.1f %.1f %.1f\n", max_x, max_y, max_z);
 
@@ -785,20 +892,33 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
                                     unsigned int p_idx = brushsides[side_idx + s].column1.plane;
                                     if (p_idx < num_planes) {
                                         const CoD1Plane* pl = &planes[p_idx];
+                                        float pdist = pl->dist + pl->normal[0] * ox + pl->normal[1] * oy + pl->normal[2] * oz;
                                         sb_append_f(&sb, "  plane %.4f %.4f %.4f %.2f\n",
-                                                    pl->normal[0], pl->normal[1], pl->normal[2], pl->dist);
+                                                    pl->normal[0], pl->normal[1], pl->normal[2], pdist);
                                     }
                                 }
                             }
                         }
 
+                        {unsigned int side,plane_index=0;
+                         for(side=0;side<num_sides;side++){
+                            unsigned int material=brushsides[side_idx+side].material_id;
+                            if(side>=6 && (!planes || brushsides[side_idx+side].column1.plane>=num_planes))continue;
+                            sb_append_f(&sb,"  planeSurfaceFlags %u %d\n",plane_index++,materials && material<num_materials?(int)materials[material].flags:0);
+                         }}
                         sb_append(&sb, "  material \"textures/common/nodraw\"\n");
-                        if (is_playerclip) sb_append(&sb, "  contents playerclip\n");
+                        if (is_trigger) sb_append(&sb, "  contents trigger\n");
+                        else if (is_ladder) sb_append(&sb, "  contents ladder\n");
+                        else if (is_playerclip) sb_append(&sb, "  contents playerclip\n");
+                        else if (is_shotclip) sb_append(&sb, "  contents shotclip\n");
                         else if (is_trigger) sb_append(&sb, "  contents trigger\n");
                         else if (strstr(mat_name, "water") != NULL) sb_append(&sb, "  contents water\n");
                         else sb_append(&sb, "  contents solid\n");
                         sb_append(&sb, "}\n\n");
                         brushes_emitted++;
+                        if (is_ladder) {
+                            { float nav_a[3] = { min_x, min_y, min_z }, nav_b[3] = { max_x, max_y, max_z }; cod_nav_add_ladder_box(&nav_builder, nav_a, nav_b); }
+                        }
                         if (brush_box_n >= brush_box_cap) {
                             int ncap = brush_box_cap ? brush_box_cap * 2 : 256;
                             BrushBox* grown = (BrushBox*)realloc(brush_boxes, (size_t)ncap * sizeof(BrushBox));
@@ -807,7 +927,8 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
                                 brush_box_cap = ncap;
                             }
                         }
-                        if (brush_box_n < brush_box_cap) {
+                        if ((owner==0 || visible_models[owner]) && brush_box_n < brush_box_cap && !is_shotclip && !is_ladder && !is_trigger &&
+                            strstr(mat_name, "water") == NULL) {
                             brush_boxes[brush_box_n].min[0] = min_x;
                             brush_boxes[brush_box_n].min[1] = min_y;
                             brush_boxes[brush_box_n].min[2] = min_z;
@@ -815,6 +936,7 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
                             brush_boxes[brush_box_n].max[1] = max_y;
                             brush_boxes[brush_box_n].max[2] = max_z;
                             brush_box_n++;
+                            { float nav_a[3] = { min_x, min_y, min_z }, nav_b[3] = { max_x, max_y, max_z }; cod_nav_add_walkable_box(&nav_builder, nav_a, nav_b); }
                         }
                     }
                 }
@@ -829,12 +951,6 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
         lumps[LUMP_MESHVERTS].length > 0) {
 
         unsigned int num_soups = lumps[LUMP_TRIANGLESOUPS].length / sizeof(CoDTriangleSoup);
-        if (lumps[LUMP_MODELS].length >= sizeof(CoD1Model)) {
-            const CoD1Model* world_model = (const CoD1Model*)(bytes + lumps[LUMP_MODELS].offset);
-            if (world_model->num_surfs > 0 && (unsigned int)world_model->num_surfs <= num_soups) {
-                num_soups = (unsigned int)world_model->num_surfs;
-            }
-        }
         const CoDTriangleSoup* soups = (const CoDTriangleSoup*)(bytes + lumps[LUMP_TRIANGLESOUPS].offset);
 
         unsigned int num_verts = lumps[LUMP_VERTICES].length / sizeof(CoD1Vertex);
@@ -847,6 +963,7 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
         int meshes_emitted = 0;
 
         for (s = 0; s < num_soups; s++) {
+
             const CoDTriangleSoup* soup = &soups[s];
             unsigned int v, t;
 
@@ -912,8 +1029,8 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
             int nonsolid_flag = (cflags & 0x20000000) && !solid_bits;
             int walkable = 0;
             int hits_brush = 0;
+            float bmin[3], bmax[3];
             {
-                float bmin[3], bmax[3];
                 int up = 0, tris = 0, bi;
                 unsigned int vv;
                 bmin[0] = bmin[1] = bmin[2] = 1.0e30f;
@@ -968,14 +1085,21 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
                 cont = "solid";
             } else if (brushes_emitted == 0) {
                 if (walkable || solid_bits) cont = "solid";
-            } else if (!hits_brush && walkable) {
-                /* The draw mesh is the floor. A mesh that touches a brush is detail. */
+            } else if (!hits_brush && (walkable || solid_bits)) {
+                /* The draw mesh is the floor or a solid patch (e.g. cylinder). A mesh that touches a brush is detail. */
                 cont = "solid";
+            }
+            if (walkable && (strcmp(cont, "solid") == 0 || strcmp(cont, "playerclip") == 0)) {
+                { float nav_a[3] = { bmin[0], bmin[1], bmin[2] - 4.f }; cod_nav_add_walkable_box(&nav_builder, nav_a, bmax); }
             }
 
             sb_append(&sb, "mesh {\n");
+            model_tags(&sb,models,visible_models,linked_models,model_count,s,1);
             sb_append_f(&sb, "  material \"%s\"\n", mat_name);
+            sb_append_f(&sb,"  surfaceFlags %d\n",materials && soup->material_id<num_materials?(int)materials[soup->material_id].flags:0);
             sb_append_f(&sb, "  contents %s\n", cont);
+            if(soup->lightmap_index>=0 && (unsigned int)soup->lightmap_index<lumps[LUMP_LIGHTMAPS].length/(512u*512u*3u))
+                sb_append_f(&sb,"  lightmap \"codlightmaps/%s/%d.tga\"\n",mname,(int)soup->lightmap_index);
 
             for (v = 0; v < soup->vertex_count; v++) {
                 const CoD1Vertex* vert = &verts[soup->vertex_offset + v];
@@ -986,10 +1110,12 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
                     tu = vert->pos[0] * (1.f / 192.f);
                     tv = vert->pos[1] * (1.f / 192.f);
                 }
-                sb_append_f(&sb, "  v %.1f %.1f %.1f %.4f %.4f %.2f %.2f %.2f\n",
+                const unsigned char* rgba=(const unsigned char*)&vert->color;
+                sb_append_f(&sb, "  v %.1f %.1f %.1f %.4f %.4f %.2f %.2f %.2f %.6f %.6f %.6f %.6f %.6f %.6f\n",
                             vert->pos[0], vert->pos[1], vert->pos[2],
                             tu, tv,
-                            vert->normal[0], vert->normal[1], vert->normal[2]);
+                            vert->normal[0], vert->normal[1], vert->normal[2],vert->lightmap[0],vert->lightmap[1],
+                            rgba[0]/255.0,rgba[1]/255.0,rgba[2]/255.0,rgba[3]/255.0);
             }
 
             for (t = 0; t + 2 < soup->triangle_count; t += 3) {
@@ -1019,12 +1145,27 @@ int bsp_to_helix(const void* data, size_t size, const char* map_name,
             sb_append(&sb, "  material \"textures/dev/floor\"\n");
             sb_append(&sb, "  contents solid\n");
             sb_append(&sb, "}\n\n");
+            { float nav_a[3] = { fmin_x, fmin_y, fz - 32.f }, nav_b[3] = { fmax_x, fmax_y, fz }; cod_nav_add_walkable_box(&nav_builder, nav_a, nav_b); }
         }
     }
 
     /* Draw soups stay visual. Retail collision for the ground is these patches. */
     emit_terrain_collision(&sb, bytes, size, lumps, materials, num_materials);
 
+    {
+        size_t nav_len = 0;
+        char* nav_text = cod_nav_emit_hxmap(&nav_builder, &nav_len);
+        if (nav_text) {
+            sb_append(&sb, nav_text);
+            free(nav_text);
+        }
+    }
+    cod_nav_free(&nav_builder);
+
+    free(visible_models);
+    free(linked_models);
+    free(trigger_models);
+    free(model_origins);
     free(brush_boxes);
     *out_buf = (unsigned char*)sb.data;
     *out_size = (unsigned int)sb.len;

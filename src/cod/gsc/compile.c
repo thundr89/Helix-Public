@@ -12,7 +12,8 @@
  * literals, identifiers, + - * /, parentheses, <, == and name(expr, ...)
  * calls. A path::name(...) call emits GSC_FAR. thread name() and
  * thread path::name() emit GSC_THREAD. wait, waittill, getent, and a
- * call on self emit GSC_STOP.
+ * call on self emit GSC_STOP in legacy mode. Runtime mode emits resumable
+ * waits, receiver calls, shared globals and event output assignments.
  */
 #include "gsc/compile.h"
 
@@ -46,6 +47,8 @@ typedef struct LoopCtx {
 } LoopCtx;
 
 typedef struct Comp {
+    int runtime;
+    const char* source;
     GscProg* prog;
     int strs_cap;
     int strs_len;
@@ -82,8 +85,12 @@ static int read_ident(Cur* c, char* out, size_t cap) {
 
 static const char* match_brace(const char* p, const char* end) {
     int d = 0;
+    int quoted = 0;
     if (p >= end || *p != '{') return NULL;
     for (; p < end; p++) {
+        if (quoted && *p == '\\' && p + 1 < end) { p++; continue; }
+        if (*p == '"') { quoted = !quoted; continue; }
+        if (quoted) continue;
         if (*p == '{') d++;
         else if (*p == '}') {
             d--;
@@ -108,6 +115,7 @@ static int emit_ins(GscProg* p, int op, int a, int b, int str, double f) {
     p->code[p->ncode].b = b;
     p->code[p->ncode].str = str;
     p->code[p->ncode].f = f;
+    p->code[p->ncode].line = p->code[p->ncode].column = 0;
     return p->ncode++;
 }
 
@@ -179,18 +187,41 @@ static int builtin_id(const char* name) {
     if (strcmp(name, "takeWeapon") == 0 || strcmp(name, "takeAllWeapons") == 0) return GSC_BU_TAKE;
     if (strcmp(name, "ambientPlay") == 0) return GSC_BU_AMBIENT;
     if (strcmp(name, "spawnstruct") == 0) return GSC_BU_STRUCT;
+    if (strcmp(name, "precacheModel") == 0 || strcmp(name, "precachemodel") == 0) return GSC_BU_PC_MODEL;
+    if (strcmp(name, "precacheSound") == 0 || strcmp(name, "precachesound") == 0) return GSC_BU_PC_SOUND;
+    if (strcmp(name, "precacheShader") == 0 || strcmp(name, "precacheshader") == 0) return GSC_BU_PC_SHADER;
+    if (strcmp(name, "precacheItem") == 0 || strcmp(name, "precacheitem") == 0) return GSC_BU_PC_WEAPON;
+    if (strcmp(name, "loadFx") == 0 || strcmp(name, "loadfx") == 0) return GSC_BU_LOAD_FX;
+    if (strcmp(name,"getent")==0 || strcmp(name,"getEnt")==0) return GSC_BU_GETENT;
+    if (strcmp(name,"getentarray")==0 || strcmp(name,"getEntArray")==0) return GSC_BU_GETENTARRAY;
+    if (strcmp(name,"isdefined")==0 || strcmp(name,"isDefined")==0) return GSC_BU_DEFINED;
+    if (strcmp(name,"getcvar")==0 || strcmp(name,"getCvar")==0) return GSC_BU_GETCVAR;
+    if (strcmp(name,"getcvarint")==0 || strcmp(name,"getCvarInt")==0) return GSC_BU_GETCVARINT;
+    if (strcmp(name,"getcvarfloat")==0 || strcmp(name,"getCvarFloat")==0) return GSC_BU_GETCVARFLOAT;
+    if (strcmp(name, "setcvar") == 0 || strcmp(name, "setCvar") == 0) return GSC_BU_SET_CVAR;
     return 0;
 }
 
 /* Builtins that push a value on the stack (so a statement-level call to
  * them must discard it). Most host-side builtins push nothing. */
 static int builtin_pushes(int id) {
-    return id == GSC_BU_STRUCT;
+    return id == GSC_BU_STRUCT || id == GSC_BU_LOAD_FX || id >= GSC_BU_GETENT;
 }
 
 /* -------- expressions -------- */
 
 static int compile_expr(Comp* co, Cur* c);
+static int compile_arg_list(Comp* co, Cur* c, int* argc_out);
+static int runtime_method(Comp* co, Cur* c, const char* name);
+static int global_id(const char* name) {
+    return strcmp(name,"self")==0 ? 0 : strcmp(name,"level")==0 ? 1 : strcmp(name,"game")==0 ? 2 : -1;
+}
+static void get_root(Comp* co, const char* name, int slot) {
+    int id=co->runtime?global_id(name):-1;
+    if(id>=0) emit_ins(co->prog,GSC_GET_GLOBAL,id,0,-1,0.);
+    else if(slot<0) emit_ins(co->prog,GSC_PUSH_UNDEF,0,0,-1,0.);
+    else emit_ins(co->prog,GSC_GET_LOCAL,slot,0,-1,0.);
+}
 
 static int compile_postfix(Comp* co, Cur* c) {
     for (;;) {
@@ -201,17 +232,39 @@ static int compile_postfix(Comp* co, Cur* c) {
             int si;
             c->p++;
             if (!read_ident(c, field, sizeof(field))) return -1;
+            skip_ws(c);
+            if (co->runtime && c->p<c->end && *c->p=='(') {
+                if(runtime_method(co,c,field)<0)return -1;
+                continue;
+            }
             si = intern_str(co, field, strlen(field));
             emit_ins(co->prog, GSC_GET_FIELD, si, 0, si, 0.0);
             continue;
         }
         if (*c->p == '[') {
+            if(co->runtime && c->p+1<c->end && c->p[1]=='[')break;
             c->p++;
             if (compile_expr(co, c) < 0) return -1;
             skip_ws(c);
             if (c->p < c->end && *c->p == ']') c->p++;
             emit_ins(co->prog, GSC_GET_INDEX, 0, 0, -1, 0.0);
             continue;
+        }
+        if (co->runtime && (isalpha((unsigned char)*c->p) || *c->p == '_')) {
+            Cur q = *c;
+            char method[64];
+            int fi, argc;
+            if (!read_ident(&q, method, sizeof(method))) return -1;
+            skip_ws(&q);
+            if (q.p < q.end && *q.p == '(') {
+                fi = find_func_index(co->prog, method);
+                if (fi >= 0) {
+                    if (compile_arg_list(co, &q, &argc) < 0) return -1;
+                    emit_ins(co->prog, GSC_ENTITY_CALL, fi, argc, -1, 0.0);
+                } else if (runtime_method(co, &q, method) < 0) return -1;
+                *c = q;
+                continue;
+            }
         }
         break;
     }
@@ -273,7 +326,14 @@ static int compile_far_call(Comp* co, Cur* c, const char* first) {
     c->p += 2;
     if (!read_ident(c, fname, sizeof(fname))) return -1;
     skip_ws(c);
-    if (!(c->p < c->end && *c->p == '(')) return -1;
+    if (!(c->p < c->end && *c->p == '(')) {
+        if(!co->runtime)return -1;
+        len=strlen(path);
+        if(!(len>=4 && strcmp(path+len-4,".gsc")==0) && path_append(path,sizeof(path),".gsc")<0)return -1;
+        pi=intern_str(co,path,strlen(path));ni=intern_str(co,fname,strlen(fname));
+        if(pi<0 || ni<0)return -1;
+        emit_ins(co->prog,GSC_FAR_REF,pi,ni,-1,0.);return compile_postfix(co,c);
+    }
     c->p++;
     skip_ws(c);
     if (!(c->p < c->end && *c->p == ')')) {
@@ -298,17 +358,37 @@ static int compile_far_call(Comp* co, Cur* c, const char* first) {
     return compile_postfix(co, c);
 }
 
+static int compile_indirect(Comp* co, Cur* c, int flags) {
+    int argc=0;
+    if(c->p+1>=c->end || c->p[0]!='[' || c->p[1]!='[')return -1;
+    c->p+=2;
+    if(compile_expr(co,c)<0)return -1;
+    skip_ws(c);
+    if(c->p+1>=c->end || c->p[0]!=']' || c->p[1]!=']')return -1;
+    c->p+=2;
+    if(compile_arg_list(co,c,&argc)<0)return -1;
+    emit_ins(co->prog,GSC_INDIRECT,flags,argc,-1,0.);
+    return compile_postfix(co,c);
+}
+
 static int compile_prim(Comp* co, Cur* c) {
     skip_ws(c);
     if (c->p >= c->end) return -1;
+    if(co->runtime && *c->p=='!') {
+        c->p++;if(compile_prim(co,c)<0)return -1;
+        emit_ins(co->prog,GSC_NOT,0,0,-1,0.);return 0;
+    }
+    if(co->runtime && c->p+1<c->end && c->p[0]==':' && c->p[1]==':') {
+        char name[64];int fi;c->p+=2;
+        if(!read_ident(c,name,sizeof(name)))return -1;
+        fi=find_func_index(co->prog,name);if(fi<0)return -1;
+        emit_ins(co->prog,GSC_FUNC_REF,fi,0,-1,0.);return compile_postfix(co,c);
+    }
+    if(co->runtime && c->p+1<c->end && c->p[0]=='[' && c->p[1]=='[')return compile_indirect(co,c,0);
     if (*c->p == '-') {
-        /* Unary minus. Compile as 0 - prim so the int-int path uses the
-         * wrapping GSC_SUB and -2147483648 ends up with the INT_MIN bit
-         * pattern on the stack. */
         c->p++;
-        emit_ins(co->prog, GSC_PUSH_INT, 0, 0, -1, 0.0);
         if (compile_prim(co, c) < 0) return -1;
-        emit_ins(co->prog, GSC_SUB, 0, 0, -1, 0.0);
+        emit_ins(co->prog, GSC_NEG, 0, 0, -1, 0.0);
         return 0;
     }
     if (*c->p == '[') {
@@ -320,21 +400,53 @@ static int compile_prim(Comp* co, Cur* c) {
         return 0;
     }
     if (*c->p == '(') {
+        int vector = 0;
         c->p++;
         if (compile_expr(co, c) < 0) return -1;
         skip_ws(c);
-        if (c->p < c->end && *c->p == ')') c->p++;
-        return 0;
-    }
-    if (*c->p == '"') {
-        const char* s;
-        int si;
+        if (c->p < c->end && *c->p == ',') {
+            vector = 1;
+            c->p++;
+            if (compile_expr(co, c) < 0) return -1;
+            skip_ws(c);
+            if (c->p >= c->end || *c->p != ',') return -1;
+            c->p++;
+            if (compile_expr(co, c) < 0) return -1;
+            skip_ws(c);
+        }
+        if (c->p >= c->end || *c->p != ')') return -1;
         c->p++;
-        s = c->p;
-        while (c->p < c->end && *c->p != '"') c->p++;
-        si = intern_str(co, s, (size_t)(c->p - s));
-        if (c->p < c->end && *c->p == '"') c->p++;
-        emit_ins(co->prog, GSC_PUSH_STR, 0, 0, si, 0.0);
+        if (vector) emit_ins(co->prog, GSC_VECTOR, 0, 0, -1, 0.0);
+        return compile_postfix(co, c);
+    }
+    if (*c->p == '"' || (*c->p == '&' && c->p + 1 < c->end && c->p[1] == '"')) {
+        char* s;
+        size_t n = 0;
+        int si;
+        int localized = *c->p == '&';
+        if (localized) c->p++;
+        c->p++;
+        s = (char*)malloc((size_t)(c->end - c->p) + 1);
+        if (!s) return -1;
+        while (c->p < c->end && *c->p != '"') {
+            char ch = *c->p++;
+            if (ch == '\\' && c->p < c->end) {
+                char escaped = *c->p;
+                if (escaped == 'n' || escaped == 'r' || escaped == 't' ||
+                    escaped == '"' || escaped == '\\') {
+                    c->p++;
+                    ch = escaped == 'n' ? '\n' : escaped == 'r' ? '\r' :
+                         escaped == 't' ? '\t' : escaped;
+                }
+            }
+            s[n++] = ch;
+        }
+        if (c->p >= c->end) { free(s); return -1; }
+        si = intern_str(co, s, n);
+        free(s);
+        c->p++;
+        if (si < 0) return -1;
+        emit_ins(co->prog, localized ? GSC_PUSH_ISTR : GSC_PUSH_STR, 0, 0, si, 0.0);
         return 0;
     }
     /* One numeric token. A fraction (.32 or 0.32) is a float. An integer
@@ -381,7 +493,7 @@ static int compile_prim(Comp* co, Cur* c) {
             int argc = 0;
             int fi;
             int bi;
-            if (strcmp(name, "getent") == 0) {
+            if (!co->runtime && strcmp(name, "getent") == 0) {
                 /* No entity lookup. The call is the end of this branch. */
                 int depth = 0;
                 for (; c->p < c->end; c->p++) {
@@ -413,6 +525,7 @@ static int compile_prim(Comp* co, Cur* c) {
                 return compile_postfix(co, c);
             }
             bi = builtin_id(name);
+            if (!co->runtime && bi >= GSC_BU_GETENT) bi = 0;
             if (bi) {
                 emit_ins(co->prog, GSC_BUILTIN, bi, argc, -1, 0.0);
                 /* Only STRUCT (spawnstruct) pushes a value, so postfix
@@ -422,14 +535,15 @@ static int compile_prim(Comp* co, Cur* c) {
             }
             /* Unknown call: pop its args, push undefined. We model this with a
              * builtin id 0 that the runtime treats as a no-op pop. */
-            emit_ins(co->prog, GSC_BUILTIN, 0, argc, -1, 0.0);
+            emit_ins(co->prog, GSC_BUILTIN, 0, argc, co->runtime ? intern_str(co,name,strlen(name)) : -1, 0.0);
             emit_ins(co->prog, GSC_PUSH_UNDEF, 0, 0, -1, 0.0);
             return compile_postfix(co, c);
         }
         {
             int slot = local_slot(co, name);
-            if (slot < 0) emit_ins(co->prog, GSC_PUSH_UNDEF, 0, 0, -1, 0.0);
-            else emit_ins(co->prog, GSC_GET_LOCAL, slot, 0, -1, 0.0);
+            if(co->runtime && (strcmp(name,"true")==0 || strcmp(name,"false")==0))
+                emit_ins(co->prog,GSC_PUSH_INT,strcmp(name,"true")==0,0,-1,0.);
+            else get_root(co,name,slot);
         }
         return compile_postfix(co, c);
     }
@@ -468,7 +582,7 @@ static int compile_add(Comp* co, Cur* c) {
     return 0;
 }
 
-static int compile_cmp(Comp* co, Cur* c) {
+static int compile_relational(Comp* co, Cur* c) {
     if (compile_add(co, c) < 0) return -1;
     for (;;) {
         skip_ws(c);
@@ -485,9 +599,12 @@ static int compile_cmp(Comp* co, Cur* c) {
             emit_ins(co->prog, GSC_GT, 0, 0, -1, 0.0);
             continue;
         }
-        if (c->p + 1 < c->end && c->p[0] == '=' && c->p[1] == '=') {
+        if (c->p + 1 < c->end && (c->p[0] == '<' || c->p[0] == '>') && c->p[1] == '=') {
+            char op = *c->p;
             c->p += 2;
             if (compile_add(co, c) < 0) return -1;
+            emit_ins(co->prog, op == '<' ? GSC_GT : GSC_LT, 0, 0, -1, 0.0);
+            emit_ins(co->prog, GSC_PUSH_INT, 0, 0, -1, 0.0);
             emit_ins(co->prog, GSC_EQ, 0, 0, -1, 0.0);
             continue;
         }
@@ -496,8 +613,90 @@ static int compile_cmp(Comp* co, Cur* c) {
     return 0;
 }
 
+static int compile_cmp(Comp* co, Cur* c) {
+    if (compile_relational(co, c) < 0) return -1;
+    for (;;) {
+        int negate;
+        skip_ws(c);
+        if (c->p + 1 >= c->end || c->p[1] != '=' ||
+            (c->p[0] != '=' && c->p[0] != '!')) break;
+        negate = c->p[0] == '!';
+        c->p += 2;
+        if (compile_relational(co, c) < 0) return -1;
+        emit_ins(co->prog, GSC_EQ, 0, 0, -1, 0.0);
+        if (negate) {
+            emit_ins(co->prog, GSC_PUSH_INT, 0, 0, -1, 0.0);
+            emit_ins(co->prog, GSC_EQ, 0, 0, -1, 0.0);
+        }
+    }
+    return 0;
+}
+
+static int compile_bitand(Comp* co, Cur* c) {
+    if (compile_cmp(co, c) < 0) return -1;
+    for (;;) {
+        skip_ws(c);
+        if (c->p >= c->end || *c->p != '&' ||
+            (c->p + 1 < c->end && c->p[1] == '&')) break;
+        c->p++;
+        if (compile_cmp(co, c) < 0) return -1;
+        emit_ins(co->prog, GSC_BITAND, 0, 0, -1, 0.0);
+    }
+    return 0;
+}
+
+static int compile_bitxor(Comp* co, Cur* c) {
+    if (compile_bitand(co, c) < 0) return -1;
+    for (;;) {
+        skip_ws(c);
+        if (c->p >= c->end || *c->p != '^') break;
+        c->p++;
+        if (compile_bitand(co, c) < 0) return -1;
+        emit_ins(co->prog, GSC_BITXOR, 0, 0, -1, 0.0);
+    }
+    return 0;
+}
+
+static int compile_bitor(Comp* co, Cur* c) {
+    if (compile_bitxor(co, c) < 0) return -1;
+    for (;;) {
+        skip_ws(c);
+        if (c->p >= c->end || *c->p != '|' ||
+            (c->p + 1 < c->end && c->p[1] == '|')) break;
+        c->p++;
+        if (compile_bitxor(co, c) < 0) return -1;
+        emit_ins(co->prog, GSC_BITOR, 0, 0, -1, 0.0);
+    }
+    return 0;
+}
+
+static int compile_and(Comp* co,Cur* c) {
+    int branch,end;
+    if(compile_bitor(co,c)<0)return -1;
+    skip_ws(c);
+    if(co->runtime && c->p+1<c->end && c->p[0]=='&' && c->p[1]=='&') {
+        c->p+=2;branch=co->prog->ncode;emit_ins(co->prog,GSC_JUMP_IF_FALSE,0,0,-1,0.);
+        if(compile_and(co,c)<0)return -1;
+        emit_ins(co->prog,GSC_NOT,0,0,-1,0.);emit_ins(co->prog,GSC_NOT,0,0,-1,0.);
+        end=co->prog->ncode;emit_ins(co->prog,GSC_JUMP,0,0,-1,0.);
+        co->prog->code[branch].a=co->prog->ncode;emit_ins(co->prog,GSC_PUSH_INT,0,0,-1,0.);
+        co->prog->code[end].a=co->prog->ncode;
+    }
+    return 0;
+}
 static int compile_expr(Comp* co, Cur* c) {
-    return compile_cmp(co, c);
+    int branch,end;
+    if(compile_and(co,c)<0)return -1;
+    skip_ws(c);
+    if(co->runtime && c->p+1<c->end && c->p[0]=='|' && c->p[1]=='|') {
+        c->p+=2;branch=co->prog->ncode;emit_ins(co->prog,GSC_JUMP_IF_FALSE,0,0,-1,0.);
+        emit_ins(co->prog,GSC_PUSH_INT,1,0,-1,0.);end=co->prog->ncode;emit_ins(co->prog,GSC_JUMP,0,0,-1,0.);
+        co->prog->code[branch].a=co->prog->ncode;
+        if(compile_expr(co,c)<0)return -1;
+        emit_ins(co->prog,GSC_NOT,0,0,-1,0.);emit_ins(co->prog,GSC_NOT,0,0,-1,0.);
+        co->prog->code[end].a=co->prog->ncode;
+    }
+    return 0;
 }
 
 /* -------- statements -------- */
@@ -545,6 +744,14 @@ static void compile_stmt_keep(Comp* co, Cur* c) {
     const char* at = c->p;
     if (compile_stmt(co, c) < 0) {
         co->prog->ncode = snap;
+        if (co->runtime) {
+            char message[256];
+            const char* p;
+            int line = 1;
+            for (p = co->source; p < at; p++) if (*p == '\n') line++;
+            snprintf(message, sizeof(message), "GSC compiler skipped an unsupported statement at line %d", line);
+            emit_ins(co->prog,GSC_DIAGNOSTIC,0,0,intern_str(co,message,strlen(message)),0.);
+        }
         skip_failed_stmt(c);
         if (c->p == at && c->p < c->end && *c->p != '}') c->p++;
     }
@@ -646,6 +853,72 @@ static int compile_game_assign(Comp* co, Cur* c) {
  *   name = expr        name.field = expr      name[expr] = expr
  *   name += expr etc.  name++ / name--        funcname(args) / builtin
  */
+static int compile_path_assignment(Comp* co, Cur* c, const char* name, int need_semi) {
+    int field = -1, indexed = 0, compound = 0, increment = 0;
+    int base_slot, key_slot = -1;
+    get_root(co, name, local_add(co, name));
+    if (*c->p == '[' && co->prog->code[co->prog->ncode - 1].op == GSC_GET_LOCAL)
+        co->prog->code[co->prog->ncode - 1].b = 1;
+    for (;;) {
+        if (*c->p == '.') {
+            char key[64];
+            c->p++;
+            if (!read_ident(c, key, sizeof(key))) return -1;
+            field = intern_str(co, key, strlen(key)); indexed = 0;
+            if (field < 0) return -1;
+        } else if (*c->p == '[') {
+            c->p++;
+            if (compile_expr(co, c) < 0) return -1;
+            skip_ws(c);
+            if (c->p >= c->end || *c->p != ']') return -1;
+            c->p++; indexed = 1;
+        } else return -1;
+        skip_ws(c);
+        if (c->p < c->end && (*c->p == '.' || *c->p == '[')) {
+            emit_ins(co->prog, indexed ? GSC_GET_INDEX : GSC_GET_FIELD,
+                     indexed ? 0 : field, *c->p == '[', -1, 0.0);
+            continue;
+        }
+        break;
+    }
+    if (c->p + 1 < c->end &&
+        (c->p[0] == '+' || c->p[0] == '-' || c->p[0] == '*' || c->p[0] == '/')) {
+        if (c->p[1] == '=') compound = c->p[0];
+        else if ((c->p[0] == '+' || c->p[0] == '-') && c->p[0] == c->p[1]) {
+            compound = c->p[0]; increment = 1;
+        }
+    }
+    if (compound) {
+        c->p += 2;
+        base_slot = local_add(co, "@lhs_base");
+        if (indexed) {
+            key_slot = local_add(co, "@lhs_key");
+            emit_ins(co->prog, GSC_SET_LOCAL, key_slot, 0, -1, 0.0);
+        }
+        emit_ins(co->prog, GSC_SET_LOCAL, base_slot, 0, -1, 0.0);
+        emit_ins(co->prog, GSC_GET_LOCAL, base_slot, 0, -1, 0.0);
+        if (indexed) emit_ins(co->prog, GSC_GET_LOCAL, key_slot, 0, -1, 0.0);
+        emit_ins(co->prog, GSC_GET_LOCAL, base_slot, 0, -1, 0.0);
+        if (indexed) emit_ins(co->prog, GSC_GET_LOCAL, key_slot, 0, -1, 0.0);
+        emit_ins(co->prog, indexed ? GSC_GET_INDEX : GSC_GET_FIELD,
+                 indexed ? 0 : field, 0, -1, 0.0);
+        if (increment) emit_ins(co->prog, GSC_PUSH_INT, 1, 0, -1, 0.0);
+        else if (compile_expr(co, c) < 0) return -1;
+        emit_ins(co->prog, compound == '+' ? GSC_ADD : compound == '-' ? GSC_SUB :
+                 compound == '*' ? GSC_MUL : GSC_DIV, 0, 0, -1, 0.0);
+    } else {
+        if (c->p >= c->end || *c->p != '=' ||
+            (c->p + 1 < c->end && c->p[1] == '=')) return -1;
+        c->p++;
+        if (compile_expr(co, c) < 0) return -1;
+    }
+    emit_ins(co->prog, indexed ? GSC_SET_INDEX : GSC_SET_FIELD,
+             indexed ? 0 : field, 0, -1, 0.0);
+    skip_ws(c);
+    if (need_semi && c->p < c->end && *c->p == ';') c->p++;
+    return 0;
+}
+
 static int compile_lhs(Comp* co, Cur* c, const char* name,
                        const char* save, int need_semi) {
     skip_ws(c);
@@ -653,6 +926,8 @@ static int compile_lhs(Comp* co, Cur* c, const char* name,
         if (need_semi) skip_to_semi(c);
         return 0;
     }
+    if (co->runtime && (*c->p == '.' || *c->p == '['))
+        return compile_path_assignment(co, c, name, need_semi);
     if (*c->p == '(' || starts_far_call(c)) {
         /* Function, builtin, or path::name call. Rewind and let compile_prim parse it. */
         int before = co->prog->ncode;
@@ -677,7 +952,7 @@ static int compile_lhs(Comp* co, Cur* c, const char* name,
     if (c->p + 1 < c->end && c->p[0] == '+' && c->p[1] == '+') {
         int slot = local_add(co, name);
         c->p += 2;
-        emit_ins(co->prog, GSC_GET_LOCAL, slot, 0, -1, 0.0);
+        get_root(co,name,slot);
         emit_ins(co->prog, GSC_PUSH_INT, 1, 0, -1, 0.0);
         emit_ins(co->prog, GSC_ADD, 0, 0, -1, 0.0);
         emit_ins(co->prog, GSC_SET_LOCAL, slot, 0, -1, 0.0);
@@ -690,7 +965,7 @@ static int compile_lhs(Comp* co, Cur* c, const char* name,
     if (c->p + 1 < c->end && c->p[0] == '-' && c->p[1] == '-') {
         int slot = local_add(co, name);
         c->p += 2;
-        emit_ins(co->prog, GSC_GET_LOCAL, slot, 0, -1, 0.0);
+        get_root(co,name,slot);
         emit_ins(co->prog, GSC_PUSH_INT, 1, 0, -1, 0.0);
         emit_ins(co->prog, GSC_SUB, 0, 0, -1, 0.0);
         emit_ins(co->prog, GSC_SET_LOCAL, slot, 0, -1, 0.0);
@@ -708,7 +983,7 @@ static int compile_lhs(Comp* co, Cur* c, const char* name,
         int op;
         c->p += 2;
         slot = local_add(co, name);
-        emit_ins(co->prog, GSC_GET_LOCAL, slot, 0, -1, 0.0);
+        get_root(co,name,slot);
         if (compile_expr(co, c) < 0) return -1;
         op = opc == '+' ? GSC_ADD :
              opc == '-' ? GSC_SUB :
@@ -751,7 +1026,7 @@ static int compile_lhs(Comp* co, Cur* c, const char* name,
         }
         c->p++;
         slot = local_add(co, name);
-        emit_ins(co->prog, GSC_GET_LOCAL, slot, 0, -1, 0.0);
+        get_root(co,name,slot);
         if (compile_expr(co, c) < 0) return -1;
         si = intern_str(co, field, strlen(field));
         emit_ins(co->prog, GSC_SET_FIELD, si, 0, si, 0.0);
@@ -766,7 +1041,7 @@ static int compile_lhs(Comp* co, Cur* c, const char* name,
         int slot;
         c->p++;
         slot = local_add(co, name);
-        emit_ins(co->prog, GSC_GET_LOCAL, slot, 0, -1, 0.0);
+        get_root(co,name,slot);
         if (compile_expr(co, c) < 0) return -1;
         skip_ws(c);
         if (c->p < c->end && *c->p == ']') c->p++;
@@ -1202,6 +1477,11 @@ static int compile_thread(Comp* co, Cur* c) {
     char name[64];
     int at;
     skip_ws(c);
+    if(co->runtime && c->p+1<c->end && c->p[0]=='[' && c->p[1]=='[') {
+        if(compile_indirect(co,c,2)<0)return -1;
+        emit_ins(co->prog,GSC_SET_LOCAL,scratch_slot(co),0,-1,0.);
+        skip_ws(c);if(c->p<c->end && *c->p==';')c->p++;return 0;
+    }
     if (!read_ident(c, name, sizeof(name))) {
         skip_to_semi(c);
         return 0;
@@ -1230,6 +1510,65 @@ static int compile_thread(Comp* co, Cur* c) {
     skip_ws(c);
     if (c->p < c->end && *c->p == ';') c->p++;
     return 0;
+}
+
+static int runtime_method(Comp* co, Cur* c, const char* name) {
+    int argc=0, outputs[64], noutputs=0, si=intern_str(co,name,strlen(name));
+    if(strcmp(name,"waittill")==0) {
+        skip_ws(c);if(c->p>=c->end||*c->p!='(')return -1;++c->p;
+        if(compile_expr(co,c)<0)return -1;
+        skip_ws(c);
+        while(c->p<c->end&&*c->p==',') {
+            char output[64];++c->p;skip_ws(c);
+            if(!read_ident(c,output,sizeof(output)))return -1;
+            if(noutputs>=64)return -1;
+            outputs[noutputs++]=local_add(co,output);skip_ws(c);
+        }
+        if(c->p>=c->end||*c->p!=')')return -1;
+        ++c->p;
+        emit_ins(co->prog,GSC_METHOD,si,1,-1,0.);
+        for(argc=0;argc<noutputs;++argc)emit_ins(co->prog,GSC_EVENT_ARG,outputs[argc],argc,-1,0.);
+    } else {
+        if(compile_arg_list(co,c,&argc)<0)return -1;
+        emit_ins(co->prog,GSC_METHOD,si,argc,-1,0.);
+    }
+    return 0;
+}
+static int runtime_receiver_stmt(Comp* co, Cur* c, const char* save) {
+    Cur q=*c;int before=co->prog->ncode;char method[64];q.p=save;
+    if(compile_expr(co,&q)<0) { co->prog->ncode=before;return 0; }
+    skip_ws(&q);
+    if(q.p+1<q.end && q.p[0]=='[' && q.p[1]=='[') {
+        if(compile_indirect(co,&q,1)<0)return -1;
+        emit_ins(co->prog,GSC_SET_LOCAL,scratch_slot(co),0,-1,0.);
+        skip_ws(&q);if(q.p<q.end && *q.p==';')q.p++;*c=q;return 1;
+    }
+    if(!read_ident(&q,method,sizeof(method))) {
+        int i;
+        for(i=before;i<co->prog->ncode;++i) if(co->prog->code[i].op==GSC_METHOD ||
+                co->prog->code[i].op==GSC_ENTITY_CALL) {
+            emit_ins(co->prog,GSC_SET_LOCAL,scratch_slot(co),0,-1,0.);if(q.p<q.end&&*q.p==';')++q.p;*c=q;return 1;
+        }
+        co->prog->ncode=before;return 0;
+    }
+    skip_ws(&q);
+    if(strcmp(method,"thread")==0) {
+        int i;
+        if(compile_thread(co,&q)<0)return -1;
+        for(i=co->prog->ncode-1;i>=before;--i)if(co->prog->code[i].op==GSC_THREAD) { co->prog->code[i].op=GSC_ENTITY_THREAD;break; }
+        for(i=co->prog->ncode-1;i>=before;--i)if(co->prog->code[i].op==GSC_INDIRECT) { co->prog->code[i].a|=1;break; }
+    } else if(starts_far_call(&q)) {
+        int i;
+        if(compile_far_call(co,&q,method)<0)return -1;
+        for(i=co->prog->ncode-1;i>=before;--i)if(co->prog->code[i].op==GSC_FAR) { co->prog->code[i].op=GSC_ENTITY_FAR;break; }
+        emit_ins(co->prog,GSC_SET_LOCAL,scratch_slot(co),0,-1,0.);
+    } else if(q.p<q.end&&*q.p=='(') {
+        int fi=find_func_index(co->prog,method), argc;
+        if(fi>=0) { if(compile_arg_list(co,&q,&argc)<0)return -1;emit_ins(co->prog,GSC_ENTITY_CALL,fi,argc,-1,0.); }
+        else if(runtime_method(co,&q,method)<0)return -1;
+        emit_ins(co->prog,GSC_SET_LOCAL,scratch_slot(co),0,-1,0.);
+    } else { co->prog->ncode=before;return 0; }
+    skip_ws(&q);if(q.p<q.end&&*q.p==';')++q.p;*c=q;return 1;
 }
 
 /* self method(), self thread name(), and self path::name() are entity
@@ -1267,6 +1606,11 @@ static int compile_stmt(Comp* co, Cur* c) {
     if (*c->p == '{') return compile_block(co, c);
     if (*c->p == ';') { c->p++; return 0; }
     save = c->p;
+    if(co->runtime && c->p+1<c->end && c->p[0]=='[' && c->p[1]=='[') {
+        if(compile_indirect(co,c,0)<0)return -1;
+        emit_ins(co->prog,GSC_SET_LOCAL,scratch_slot(co),0,-1,0.);
+        skip_ws(c);if(c->p<c->end && *c->p==';')c->p++;return 0;
+    }
     if (!read_ident(c, name, sizeof(name))) {
         skip_to_semi(c);
         return 0;
@@ -1325,15 +1669,24 @@ static int compile_stmt(Comp* co, Cur* c) {
         }
         return 0;
     }
-    if (strcmp(name, "level") == 0) return compile_level_assign(co, c);
-    if (strcmp(name, "game") == 0) return compile_game_assign(co, c);
+    if(co->runtime) {
+        if(strcmp(name,"thread")==0)return compile_thread(co,c);
+        if(strcmp(name,"wait")==0) {
+            if(compile_expr(co,c)<0)return -1;
+            emit_ins(co->prog,GSC_WAIT,0,0,-1,0.);
+            skip_ws(c);if(c->p<c->end&&*c->p==';')++c->p;return 0;
+        }
+        { int handled=runtime_receiver_stmt(co,c,save);if(handled)return handled<0?-1:0; }
+    }
+    if (!co->runtime && strcmp(name, "level") == 0) return compile_level_assign(co, c);
+    if (!co->runtime && strcmp(name, "game") == 0) return compile_game_assign(co, c);
     if (strcmp(name, "thread") == 0) return compile_thread(co, c);
-    if (strcmp(name, "wait") == 0 || strcmp(name, "waittill") == 0) {
+    if (!co->runtime && (strcmp(name, "wait") == 0 || strcmp(name, "waittill") == 0)) {
         emit_ins(co->prog, GSC_STOP, 0, 0, -1, 0.0);
         skip_to_semi(c);
         return 0;
     }
-    if (strcmp(name, "self") == 0) {
+    if (!co->runtime && strcmp(name, "self") == 0) {
         if (self_call_stmt(c)) emit_ins(co->prog, GSC_STOP, 0, 0, -1, 0.0);
         skip_to_semi(c);
         return 0;
@@ -1394,12 +1747,14 @@ void gsc_prog_free(GscProg* p) {
     free(p->funcs);
     free(p->strs);
     free(p->stroff);
+    free(p->strhash);
     memset(p, 0, sizeof(*p));
 }
 
-int gsc_compile(const char* source, size_t size, GscProg* prog) {
+static int compile_mode(const char* source, size_t size, GscProg* prog, int runtime) {
     char* text;
     size_t w = 0;
+    int quoted = 0;
     size_t i;
     FuncDesc funcs[GSC_MAX_FUNCS];
     int nf;
@@ -1413,14 +1768,38 @@ int gsc_compile(const char* source, size_t size, GscProg* prog) {
     text = (char*)malloc(size + 1);
     if (!text) return 0;
     for (i = 0; i < size; i++) {
+        if (quoted) {
+            text[w++] = source[i];
+            if (source[i] == '\\' && i + 1 < size) text[w++] = source[++i];
+            else if (source[i] == '"') quoted = 0;
+            continue;
+        }
+        if (source[i] == '"') {
+            quoted = 1;
+            text[w++] = source[i];
+            continue;
+        }
         if (source[i] == '/' && i + 1 < size && source[i + 1] == '/') {
-            while (i < size && source[i] != '\n') i++;
+            while (i < size && source[i] != '\n') { text[w++] = ' '; i++; }
             if (i < size) text[w++] = '\n';
+            continue;
+        }
+        if (source[i] == '/' && i + 1 < size && source[i + 1] == '*') {
+            int closed = 0;
+            text[w++] = ' '; text[w++] = ' '; i += 2;
+            for (; i < size; i++) {
+                if (source[i] == '*' && i + 1 < size && source[i + 1] == '/') {
+                    text[w++] = ' '; text[w++] = ' '; i++; closed = 1; break;
+                }
+                text[w++] = source[i] == '\n' ? '\n' : ' ';
+            }
+            if (!closed) { free(text); return 0; }
             continue;
         }
         text[w++] = source[i];
     }
     text[w] = '\0';
+    if (quoted) { free(text); return 0; }
 
     nf = find_funcs(text, w, funcs, GSC_MAX_FUNCS);
 
@@ -1431,7 +1810,7 @@ int gsc_compile(const char* source, size_t size, GscProg* prog) {
         prog->fcap = nf;
     }
     for (fi = 0; fi < nf; fi++) {
-        snprintf(prog->funcs[fi].name, sizeof(prog->funcs[fi].name), "%s", funcs[fi].name);
+        snprintf(prog->funcs[fi].name, sizeof(prog->funcs[fi].name), "%.63s", funcs[fi].name);
         prog->funcs[fi].entry = -1;
         prog->funcs[fi].nparams = 0;
         prog->funcs[fi].nlocals = 0;
@@ -1439,6 +1818,8 @@ int gsc_compile(const char* source, size_t size, GscProg* prog) {
     }
 
     /* Second pass: compile each body. */
+    co.runtime = runtime;
+    co.source = text;
     co.prog = prog;
     co.strs_cap = 0;
     co.strs_len = 0;
@@ -1479,3 +1860,6 @@ int gsc_compile(const char* source, size_t size, GscProg* prog) {
     free(text);
     return 1;
 }
+
+int gsc_compile(const char* source,size_t size,GscProg* prog){return compile_mode(source,size,prog,0);}
+int gsc_compile_runtime(const char* source,size_t size,GscProg* prog){return gsc_compile_runtime_options(source,size,prog,NULL,NULL);}

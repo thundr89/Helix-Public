@@ -76,7 +76,11 @@ static int next_field(const char** pp, const char* end, char* out, size_t cap, i
     }
     if (*p == '"') {
         p++;
-        while (p < end && *p != '"') {
+        while (p < end) {
+            if (*p == '"') {
+                if (p + 1 < end && p[1] == '"') { p += 2; if (n + 1 < cap) out[n++] = '"'; continue; }
+                break;
+            }
             char c = *p++;
             if (c == '\\' && p < end) c = *p++;
             if (n + 1 < cap) out[n++] = c;
@@ -174,6 +178,15 @@ int sound_read_aliases(const void* data, size_t size, SoundAliasFile* out) {
         if (p < end && *p == '#') {
             while (p < end && *p != '\n') p++;
             continue;
+        }
+        {
+            const char* row = p;
+            next_field(&p, end, field, sizeof(field), &eol);
+            if (!field[0] || field[0] == '#') {
+                while (!eol && p < end) next_field(&p, end, field, sizeof(field), &eol);
+                continue;
+            }
+            p = row;
         }
         if (ncol == 0) {
             do {

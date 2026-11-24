@@ -40,9 +40,15 @@ int sound_to_helix(const SoundAliasFile* aliases,
             snprintf(prefixed, sizeof(prefixed), "sound/%s", file);
             file = prefixed;
         }
-        if (!cod_emit_fmt(&e, "sound \"%s\" {\n", a->name) ||
+        if(!strncmp(a->name,"american_",9) || !strncmp(a->name,"british_",8) || !strncmp(a->name,"russian_",8) || !strncmp(a->name,"german_",7))max_dist=900.f;
+        {int variant,step=!strncmp(a->name,"step_",5);char emitted[128];
+        for(variant=0;variant<(step && a->sequence>0?2:1);variant++){
+        if(variant)snprintf(emitted,sizeof(emitted),"%s__variant_%d",a->name,a->sequence);
+        else snprintf(emitted,sizeof(emitted),"%s",a->name);
+        if (!cod_emit_fmt(&e, "sound \"%s\" {\n", emitted) ||
             !cod_emit_fmt(&e, "  file \"%s\"\n", file) ||
             !cod_emit_fmt(&e, "  volume %g\n", a->vol_min) ||
+            !cod_emit_fmt(&e, "  spatial %d\n", step || !strncmp(a->name,"american_",9) || !strncmp(a->name,"british_",8) || !strncmp(a->name,"russian_",8) || !strncmp(a->name,"german_",7)) ||
             !cod_emit_fmt(&e, "  min_dist %g\n", a->dist_min) ||
             !cod_emit_fmt(&e, "  max_dist %g\n", max_dist) ||
             !cod_emit_fmt(&e, "  looping %d\n", looping) ||
@@ -52,6 +58,7 @@ int sound_to_helix(const SoundAliasFile* aliases,
             cod_emit_free(&e);
             return 0;
         }
+        }}
     }
     if (!cod_emit_take(&e, out_buf, out_size)) {
         cod_emit_free(&e);

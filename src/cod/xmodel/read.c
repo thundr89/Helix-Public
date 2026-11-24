@@ -88,6 +88,7 @@ typedef struct {
     char name[64];
     float q[4];
     float t[3];
+    unsigned components;
 } XanimPoseBone;
 
 static XanimPoseBone g_pose[XANIM_POSE_MAX];
@@ -253,6 +254,13 @@ int cod_xmodel_lod_names(const void* data, size_t size, char names[][64], int ca
     return n;
 }
 
+static int g_export_rig;
+void cod_xmodel_set_export_rig(int enabled){g_export_rig=enabled!=0;}
+static int emit_skin(Xsb* sb,int vertex,int joint,float weight,const float p[3],const float n[3]){
+    if(!g_export_rig)return 1;
+    return xsb_append_f(sb,"skin %d %d %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n",vertex,joint,weight,p[0],p[1],p[2],n[0],n[1],n[2]);
+}
+
 typedef struct {
     int parent;
     float trans[3];
@@ -309,6 +317,7 @@ static void bone_copy(const CoD1Bone* src, CoD1Bone* dst) {
 
 static void bone_compose_world(const CoD1Bone* parent, const CoD1Bone* local, CoD1Bone* world) {
     float nt[3], nq[4];
+    world->parent=local->parent;
     quat_rot(parent->q, local->trans, nt);
     world->trans[0] = nt[0] + parent->trans[0];
     world->trans[1] = nt[1] + parent->trans[1];
@@ -540,10 +549,29 @@ static int pose_skip(PoseCur* c, size_t n) {
     return 1;
 }
 
-/* Stores frame 0. Later frames are consumed so the next part stays aligned. */
-static int pose_rotation(PoseCur* c, int compressed, int negate, unsigned total, int small, float q[4]) {
+/* Sparse channels carry their own frame times. Select neighboring keys. */
+static int pose_keys(PoseCur* c,unsigned fc,unsigned total,int small,unsigned frame,unsigned* a,unsigned* b,float* blend) {
+    unsigned i,previous=0,lo=0,hi=0;int found=0;
+    *a=*b=0;*blend=0;
+    if(fc<=1)return 1;
+    if(fc==total){*a=*b=frame<fc?frame:fc-1;return 1;}
+    for(i=0;i<fc;i++){
+        unsigned key;unsigned char byte;unsigned short word;
+        if(small){if(!pose_u8(c,&byte))return 0;key=byte;}else{if(!pose_u16(c,&word))return 0;key=word;}
+        if(key>=total || (i && key<=previous))return 0;previous=key;
+        if(key<=frame){*a=i;lo=key;}
+        else if(!found){*b=i;hi=key;found=1;}
+    }
+    if(!found)*b=*a;
+    else if(hi>lo && frame>=lo)*blend=(float)(frame-lo)/(float)(hi-lo);
+    return 1;
+}
+
+
+static int pose_rotation(PoseCur* c, int compressed, int negate, unsigned total, int small, unsigned frame, float q[4]) {
     unsigned short fc;
-    unsigned i;
+    unsigned i,a,b;float blend;
+    float qa[4]={0,0,0,1},qb[4]={0,0,0,1};
     if (!pose_u16(c, &fc) || fc > total) return 0;
     if (fc == 0) {
         q[0] = q[1] = q[2] = 0.f;
@@ -551,7 +579,7 @@ static int pose_rotation(PoseCur* c, int compressed, int negate, unsigned total,
         return 1;
     }
     /* A single sample is inline. The key table exists only for a sparse run. */
-    if (fc > 1 && fc < total && !pose_skip(c, small ? fc : (size_t)fc * 2)) return 0;
+    if(!pose_keys(c,fc,total,small,frame,&a,&b,&blend))return 0;
     for (i = 0; i < fc; i++) {
         float tmp[4];
         int neg = (i == 0) && negate;
@@ -560,34 +588,28 @@ static int pose_rotation(PoseCur* c, int compressed, int negate, unsigned total,
         } else if (!pose_quat4(c, neg, tmp)) {
             return 0;
         }
-        if (i == 0) {
-            q[0] = tmp[0];
-            q[1] = tmp[1];
-            q[2] = tmp[2];
-            q[3] = tmp[3];
-        }
+        if(i==a)memcpy(qa,tmp,sizeof(qa));if(i==b)memcpy(qb,tmp,sizeof(qb));
     }
+    {float dot=0;int k;for(k=0;k<4;k++)dot+=qa[k]*qb[k];for(k=0;k<4;k++)q[k]=qa[k]*(1-blend)+qb[k]*(dot<0?-blend:blend);pose_normalize(q);}
     return 1;
 }
 
-static int pose_translation(PoseCur* c, unsigned total, int small, float t[3]) {
+static int pose_translation(PoseCur* c, unsigned total, int small, unsigned frame, float t[3]) {
     unsigned short fc;
-    unsigned i;
+    unsigned i,a,b;float blend;float ta[3]={0},tb[3]={0};
     if (!pose_u16(c, &fc) || fc > total) return 0;
     if (fc == 0) {
         t[0] = t[1] = t[2] = 0.f;
         return 1;
     }
-    if (fc > 1 && fc < total && !pose_skip(c, small ? fc : (size_t)fc * 2)) return 0;
+    if(!pose_keys(c,fc,total,small,frame,&a,&b,&blend))return 0;
     for (i = 0; i < fc; i++) {
         float x, y, z;
         if (!pose_f32(c, &x) || !pose_f32(c, &y) || !pose_f32(c, &z)) return 0;
-        if (i == 0) {
-            t[0] = x;
-            t[1] = y;
-            t[2] = z;
-        }
+        if(i==a){ta[0]=x;ta[1]=y;ta[2]=z;}
+        if(i==b){tb[0]=x;tb[1]=y;tb[2]=z;}
     }
+    for(i=0;i<3;i++)t[i]=ta[i]*(1-blend)+tb[i]*blend;
     return 1;
 }
 
@@ -595,7 +617,7 @@ static int pose_bit(const unsigned char* bits, int index) {
     return (bits[index >> 3] >> (index & 7)) & 1;
 }
 
-static int pose_load(const void* xanim, size_t size, XanimPoseBone* dest, int cap, int* out_count) {
+static int pose_load(const void* xanim, size_t size, XanimPoseBone* dest, int cap, int* out_count,unsigned frame,size_t* end) {
     PoseCur c;
     unsigned short ver = 0, frames = 0;
     short part_count = 0;
@@ -624,8 +646,8 @@ static int pose_load(const void* xanim, size_t size, XanimPoseBone* dest, int ca
     bit_bytes = ((size_t)part_count + 7u) / 8u;
     if (delta) {
         float q[4], t[3];
-        if (!pose_rotation(&c, 0, 0, total, small, q)) return 0;
-        if (!pose_translation(&c, total, small, t)) return 0;
+        if (!pose_rotation(&c, 1, 0, total, small, frame, q)) return 0;
+        if (!pose_translation(&c, total, small, frame, t)) return 0;
     }
     if (!pose_skip(&c, bit_bytes) || !pose_skip(&c, bit_bytes)) return 0;
     memcpy(sign, c.p + c.o - bit_bytes * 2, bit_bytes);
@@ -634,10 +656,13 @@ static int pose_load(const void* xanim, size_t size, XanimPoseBone* dest, int ca
         if (!pose_name(&c, dest[i].name, sizeof(dest[i].name))) return 0;
     }
     for (i = 0; i < (int)part_count; i++) {
-        if (!pose_rotation(&c, pose_bit(comp, i), pose_bit(sign, i), total, small, dest[i].q))
+        if(!pose_need(&c,2))return 0;dest[i].components=(c.p[c.o]||c.p[c.o+1])?1u:0u;
+        if (!pose_rotation(&c, pose_bit(comp, i), pose_bit(sign, i), total, small, frame, dest[i].q))
             return 0;
-        if (!pose_translation(&c, total, small, dest[i].t)) return 0;
+        if(!pose_need(&c,2))return 0;if(c.p[c.o]||c.p[c.o+1])dest[i].components|=2;
+        if (!pose_translation(&c, total, small, frame, dest[i].t)) return 0;
     }
+    if(end)*end=c.o;
     *out_count = (int)part_count;
     return 1;
 }
@@ -646,16 +671,16 @@ int cod_xmodel_set_anim_pose(const void* xanim, size_t size) {
     int n = 0;
     g_pose_count = 0;
     if (!xanim || size < 8) return 0;
-    if (!pose_load(xanim, size, g_pose, XANIM_POSE_MAX, &n)) return 0;
+    if (!pose_load(xanim, size, g_pose, XANIM_POSE_MAX, &n,0,NULL)) return 0;
     g_pose_count = n;
     return 1;
 }
 
-int cod_xmodel_overlay_anim_pose(const void* xanim, size_t size) {
+int cod_xmodel_overlay_anim_frame(const void* xanim, size_t size,unsigned frame) {
     XanimPoseBone extra[XANIM_POSE_MAX];
     int n = 0;
     int i, p;
-    if (!pose_load(xanim, size, extra, XANIM_POSE_MAX, &n)) return 0;
+    if (!pose_load(xanim, size, extra, XANIM_POSE_MAX, &n,frame,NULL)) return 0;
     for (i = 0; i < n; i++) {
         for (p = 0; p < g_pose_count; p++) {
             if (strcmp(g_pose[p].name, extra[i].name) == 0) break;
@@ -664,11 +689,22 @@ int cod_xmodel_overlay_anim_pose(const void* xanim, size_t size) {
             if (g_pose_count >= XANIM_POSE_MAX) return 0;
             g_pose[g_pose_count++] = extra[i];
         } else {
-            g_pose[p] = extra[i];
+            if(extra[i].components&1)memcpy(g_pose[p].q,extra[i].q,sizeof(extra[i].q));
+            if(extra[i].components&2)memcpy(g_pose[p].t,extra[i].t,sizeof(extra[i].t));
+            g_pose[p].components|=extra[i].components;
         }
     }
     return 1;
 }
+
+void cod_xmodel_remove_anim_bone(const char* name) {
+    int i;if(!name)return;
+    for(i=0;i<g_pose_count;i++)if(!strcmp(g_pose[i].name,name)){
+        memmove(g_pose+i,g_pose+i+1,(g_pose_count-i-1)*sizeof(g_pose[0]));--g_pose_count;return;
+    }
+}
+
+int cod_xmodel_overlay_anim_pose(const void* xanim,size_t size){return cod_xmodel_overlay_anim_frame(xanim,size,0);}
 
 static void apply_anim_pose(const unsigned char* parts, size_t parts_size, CoD1Bone* locals,
                             int total, int child_count) {
@@ -692,18 +728,22 @@ static void apply_anim_pose(const unsigned char* parts, size_t parts_size, CoD1B
         off = end + 1 + 24;
         for (p = 0; p < g_pose_count; p++) {
             if (strcmp(g_pose[p].name, name) != 0) continue;
-            locals[i].q[0] = g_pose[p].q[0];
-            locals[i].q[1] = g_pose[p].q[1];
-            locals[i].q[2] = g_pose[p].q[2];
-            locals[i].q[3] = g_pose[p].q[3];
-            locals[i].trans[0] = g_pose[p].t[0];
-            locals[i].trans[1] = g_pose[p].t[1];
-            locals[i].trans[2] = g_pose[p].t[2];
+            if(g_pose[p].components&1)memcpy(locals[i].q,g_pose[p].q,sizeof(locals[i].q));
+            if(g_pose[p].components&2){int axis;for(axis=0;axis<3;axis++)locals[i].trans[axis]=(locals[i].parent>=0?locals[i].trans[axis]:0)+g_pose[p].t[axis];}
             break;
         }
     }
 }
 
+
+static int part_named(const unsigned char* p,size_t n,const char* name) {
+    size_t off;int i,total;if(!p || n<6)return -1;
+    total=(int)(p[2]|p[3]<<8)+(int)(p[4]|p[5]<<8);off=6+(size_t)(p[2]|p[3]<<8)*19;
+    for(i=0;i<total;i++){size_t start=off;while(off<n && p[off])off++;if(off>=n)return -1;
+        if(off-start==strlen(name) && !memcmp(p+start,name,off-start))return i;
+        off+=25;if(off>n)return -1;}
+    return -1;
+}
 static int cod_xmodel_load_bones(const unsigned char* parts, size_t parts_size, CoD1Bone** out_locals,
                                  CoD1Bone** out_worlds, unsigned short* out_num_bones) {
     size_t p_off = 0;
@@ -871,6 +911,9 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
     CoD1Bone* bones = NULL;
     CoD1Bone* bone_locals = NULL;
     unsigned short p_num_bones = 0;
+    int controlled_bone=part_named(parts,parts_size,"mg01");
+    float joint_pivot[3]={0,0,0};
+    if(controlled_bone>=0){float tag[12];if(cod_xmodel_view_tag(parts,parts_size,"tag_aim",tag)){joint_pivot[0]=tag[11];joint_pivot[1]=-tag[9];joint_pivot[2]=tag[10];}else controlled_bone=-1;}
 
     if (parts && parts_size >= 6 &&
         cod_xmodel_load_bones(parts, parts_size, &bone_locals, &bones, &p_num_bones)) {
@@ -1067,6 +1110,7 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
                     local[0] = xyz[v * 3];
                     local[1] = xyz[v * 3 + 1];
                     local[2] = xyz[v * 3 + 2];
+                    if(!emit_skin(sb,vert_base+v,bi,wcs[v]?pweights[v]:1.f,local,nrm+v*3))ok=0;
                     bone_point(bones, p_num_bones, bi, local, placed);
                     scale = wcs[v] ? pweights[v] : 1.f;
                     xyz[v * 3] = placed[0] * scale;
@@ -1093,6 +1137,7 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
                             ok = 0;
                             break;
                         }
+                        {const float zero[3]={0,0,0};if(!emit_skin(sb,vert_base+v,(int)bone_i,wt,o,zero))ok=0;}
                         bone_point(bones, p_num_bones, (int)bone_i, o, bp);
                         xyz[v * 3] += bp[0] * wt;
                         xyz[v * 3 + 1] += bp[1] * wt;
@@ -1109,6 +1154,10 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
             for (v = 0; ok && v < num_verts; v++) {
                 float px = xyz[v * 3], py = xyz[v * 3 + 1], pz = xyz[v * 3 + 2];
                 float nx = nrm[v * 3], ny = nrm[v * 3 + 1], nz = nrm[v * 3 + 2];
+                if(!rigged && bones && g_export_rig){
+                    const float point[3]={px,py,pz},normal[3]={nx,ny,nz};
+                    if(!emit_skin(sb,vert_base+v,bone,1.f,point,normal))ok=0;
+                }
                 if (rq) {
                     float ip[3], in[3], op[3], on[3];
                     ip[0] = px;
@@ -1144,8 +1193,16 @@ static int emit_surfs_v14(const unsigned char* p, size_t size, size_t off,
         }
         wrote = 1;
         {
-            int t;
+            int t,last_controlled=-1;
             for (t = 0; t < stored; t++) {
+                if(controlled_bone>=0 && pbones) {
+                    int k,controlled=1;
+                    for(k=0;k<3;k++){int bi=rigged?pbones[tris[t*3+k]]:bone,steps=0;
+                        while(bones && bi>=0 && bi<p_num_bones && bi!=controlled_bone && steps++<p_num_bones)bi=bones[bi].parent;
+                        if(bi!=controlled_bone)controlled=0;
+                    }
+                    if(controlled!=last_controlled){if(!xsb_append_f(sb,"joint %s %.9g %.9g %.9g\n",controlled?"mg01":"none",joint_pivot[0],joint_pivot[1],joint_pivot[2]))return 0;last_controlled=controlled;}
+                }
                 int a = vert_base + (int)tris[t * 3 + 0];
                 int b = vert_base + (int)tris[t * 3 + 1];
                 int c = vert_base + (int)tris[t * 3 + 2];
@@ -1380,7 +1437,6 @@ static void store_mat(const char* pick) {
     if (n + 1 > sizeof(tmp)) return;
     memcpy(tmp, pick, n + 1);
     slash = strchr(tmp, '/') != NULL || strchr(tmp, '\\') != NULL;
-    if (n >= 4) memcpy(tmp + n - 4, ".png", 4);
     if (!slash) {
         if (n + 7 > sizeof(g_mats[0])) return;
         memcpy(g_mats[g_nmat], "skins/", 6);
@@ -1522,6 +1578,31 @@ static int emit_text(const char* text, size_t size, Xsb* sb) {
     return ok && saw_version && sb->len > 16;
 }
 
+static int emit_bind_tags(const unsigned char* parts,size_t size,Xsb* sb) {
+    CoD1Bone *local=NULL,*world=NULL;unsigned short count=0,version,children,roots;size_t off=0;int i;
+    if(!parts || !cod_xmodel_load_bones(parts,size,&local,&world,&count))return 1;
+    if(!ru16(parts,size,&off,&version) || !ru16(parts,size,&off,&children) || !ru16(parts,size,&off,&roots)){free(local);free(world);return 0;}
+    off=6+(size_t)children*19;
+    for(i=0;i<count;i++){
+        char name[96];size_t n=0;float x[3]={1,0,0},y[3]={0,1,0},z[3]={0,0,1},rx[3],ry[3],rz[3];
+        while(off<size && parts[off] && n+1<sizeof(name))name[n++]=(char)parts[off++];name[n]=0;
+        if(off>=size || parts[off] || off+1+24>size)break;off+=1+24;
+        if(!n && g_export_rig)snprintf(name,sizeof(name),"__unnamed_joint_%d",i);
+        if(!*name || strpbrk(name,"\t\r\n\""))continue;
+        if(g_export_rig && !xsb_append_f(sb,"bone \"%s\" %d %.9g %.9g %.9g %.9g %.9g %.9g %.9g\n",name,local[i].parent,local[i].q[0],local[i].q[1],local[i].q[2],local[i].q[3],local[i].trans[0],local[i].trans[1],local[i].trans[2])){free(local);free(world);return 0;}
+        if(strchr(name,' '))continue;
+        quat_rot(world[i].q,x,rx);quat_rot(world[i].q,y,ry);quat_rot(world[i].q,z,rz);
+        if(!xsb_append_f(sb,"tag %s",name) ||
+           !xsb_append_f(sb," %.9g %.9g %.9g 0",rx[0],rx[1],rx[2]) ||
+           !xsb_append_f(sb," %.9g %.9g %.9g 0",ry[0],ry[1],ry[2]) ||
+           !xsb_append_f(sb," %.9g %.9g %.9g 0",rz[0],rz[1],rz[2]) ||
+           !xsb_append_f(sb," %.9g %.9g %.9g 1\n",world[i].trans[0],world[i].trans[1],world[i].trans[2])){
+            free(local);free(world);return 0;
+        }
+    }
+    free(local);free(world);return 1;
+}
+
 int cod_xmodel_to_obj(const void* xmodel, size_t xmodel_size,
                       const void* surfs, size_t surfs_size,
                       const void* parts, size_t parts_size,
@@ -1550,6 +1631,7 @@ int cod_xmodel_to_obj(const void* xmodel, size_t xmodel_size,
             }
             if (ok) ok = emit_surfs((const unsigned char*)surfs, surfs_size,
                                     (const unsigned char*)parts, parts_size, &sb);
+            if(ok)ok=emit_bind_tags((const unsigned char*)parts,parts_size,&sb);
         }
         if (xmodel && xmodel_size >= 2 && !cod_xmodel_is_text(xmodel, xmodel_size)) {
             unsigned short ver = 0;
@@ -1568,4 +1650,58 @@ int cod_xmodel_to_obj(const void* xmodel, size_t xmodel_size,
     *out_buf = (unsigned char*)sb.data;
     *out_size = (unsigned int)sb.len;
     return 1;
+}
+
+/* Generic named channels. Raw proprietary bytes never cross into the host decoder. */
+static void generic_u32(unsigned char* p,unsigned value){p[0]=(unsigned char)value;p[1]=(unsigned char)(value>>8);p[2]=(unsigned char)(value>>16);p[3]=(unsigned char)(value>>24);}
+static void generic_float(unsigned char* p,float value){unsigned bits;memcpy(&bits,&value,4);generic_u32(p,bits);}
+int cod_xanim_generic(const void* data,size_t size,unsigned char** out,unsigned* length){
+    const unsigned char* p=(const unsigned char*)data;XanimPoseBone pose[XANIM_POSE_MAX];
+    unsigned frames,rate,frame,j,count,bytes,nnotes=0;size_t cells,offset,end=0,note_start=0;int n=0;unsigned char* result;
+    if(!p || size<9 || p[0]!=14 || p[1] || !out || !length)return 0;
+    frames=p[2]|((unsigned)p[3]<<8);rate=p[7]|((unsigned)p[8]<<8);
+    if(!frames || !rate || rate>10000 || !pose_load(data,size,pose,XANIM_POSE_MAX,&n,0,&end) || n<=0)return 0;
+    count=(unsigned)n;cells=(size_t)frames*count;
+    if(cells>2000000u)return 0;bytes=36+count*68+(unsigned)cells*28;
+    note_start=end;
+    if(end<size){
+        nnotes=p[end++];for(j=0;j<nnotes;j++){
+            size_t start=end;unsigned key;while(end<size && p[end])end++;
+            if(end==size || end==start || end-start>63 || size-end<3)return 0;end++;
+            key=p[end]|((unsigned)p[end+1]<<8);end+=2;
+            if(key>frames-((p[6]&1)?0u:1u))return 0;
+        }
+        if(end!=size)return 0;
+    }
+    bytes+=4+(nnotes+1)*68;
+    result=(unsigned char*)malloc(bytes);if(!result)return 0;
+    memcpy(result,"HXAC1\0\0\0",8);generic_u32(result+8,frames);generic_u32(result+12,count);
+    generic_float(result+16,(float)rate);generic_u32(result+20,(p[6]&1)|14u);
+    {float delta[3]={0,0,0};if(p[6]&2){
+        PoseCur c={(const unsigned char*)data,size,9};float q[4],first[3],last[3];
+        const unsigned total=frames+((p[6]&1)?1u:0u);const int small=total<=256;
+        if(!pose_rotation(&c,1,0,total,small,0,q)||!pose_translation(&c,total,small,0,first)){free(result);return 0;}
+        c.o=9;
+        if(!pose_rotation(&c,1,0,total,small,total-1,q)||!pose_translation(&c,total,small,total-1,last)){free(result);return 0;}
+        for(j=0;j<3;j++)delta[j]=last[j]-first[j];
+    }for(j=0;j<3;j++)generic_float(result+24+j*4,delta[j]);}
+    for(j=0;j<count;j++){memset(result+36+j*68,0,64);memcpy(result+36+j*68,pose[j].name,strlen(pose[j].name));generic_u32(result+36+j*68+64,pose[j].components);}
+    offset=36+count*68;
+    for(frame=0;frame<frames;frame++){
+        if(frame && (!pose_load(data,size,pose,XANIM_POSE_MAX,&n,frame,NULL) || (unsigned)n!=count)){free(result);return 0;}
+        for(j=0;j<count;j++){
+            unsigned k;for(k=0;k<4;k++){generic_float(result+offset,pose[j].q[k]);offset+=4;}
+            for(k=0;k<3;k++){generic_float(result+offset,pose[j].t[k]);offset+=4;}
+        }
+    }
+    generic_u32(result+offset,nnotes+1);offset+=4;
+    end=note_start+(note_start<size?1:0);
+    for(j=0;j<nnotes;j++){
+        size_t start=end;unsigned key;while(p[end])end++;
+        memset(result+offset,0,68);memcpy(result+offset+4,p+start,end-start);end++;
+        key=p[end]|((unsigned)p[end+1]<<8);end+=2;
+        generic_float(result+offset,frames>1 || (p[6]&1)?(float)key/(float)(frames-((p[6]&1)?0u:1u)):0.f);offset+=68;
+    }
+    memset(result+offset,0,68);generic_float(result+offset,1.f);memcpy(result+offset+4,"end",4);
+    *out=result;*length=bytes;return 1;
 }

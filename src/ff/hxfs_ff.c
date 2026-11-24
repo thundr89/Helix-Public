@@ -8,7 +8,7 @@
  * (at your option) any later version.
  */
 
-#include "iasset_plugin.h"
+#include "helix/fs/iasset_plugin.h"
 #include "ff_file.h"
 
 #include <stdio.h>

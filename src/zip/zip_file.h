@@ -22,7 +22,8 @@ typedef struct ZipFile ZipFile;
 /* Takes a copy of `bytes`. Returns NULL on parse failure. */
 ZipFile* zip_open_mem(const void* bytes, size_t len);
 
-/* Reads the whole file into memory. Returns NULL on I/O or parse failure. */
+/* Keeps the file open and reads the central directory. Payloads are read on demand.
+ * Returns NULL on I/O or parse failure. */
 ZipFile* zip_open_file(const char* path);
 
 void zip_close(ZipFile* p);

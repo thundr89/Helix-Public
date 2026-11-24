@@ -18,6 +18,8 @@ extern "C" {
 
 typedef struct CodShader {
     char name[128];
+    char skybox[128];
+    char sunfile[128];
     char image[128]; /* gameplay map / clampmap; editor image is only a fallback */
     float alpha_test; /* 0 = off, otherwise discard threshold in 0..1 */
     int blend; /* 0 opaque, 1 alpha, 2 additive */
@@ -26,6 +28,9 @@ typedef struct CodShader {
     int invisible; /* nodraw, caulk, hint, skip, portal */
     int has_uv_xform; /* tcMod transform: s' = a*s + c*t + tx, t' = b*s + d*t + ty */
     float uv_xform[6];
+    float uv_scroll[2]; /* s_speed, t_speed */
+    float uv_rotate;    /* degrees per second */
+    float uv_turb[4];   /* base, amp, phase, freq */
 } CodShader;
 
 typedef struct CodShaderFile {

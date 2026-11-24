@@ -43,6 +43,8 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+The SDK header is the engine's `include/helix/fs/iasset_plugin.h`. This tree lives at `include/helix-public`, so CMake reads the header from the parent `include` directory. Override that with `-DHELIX_ENGINE_INCLUDE=...` when the checkout is somewhere else.
+
 Needs zlib (`find_package(ZLIB)`). Produces `hxfs_wad.dll` / `hxfs_pak.dll` / `hxfs_pk3.dll` / `hxfs_pk4.dll` / `hxfs_iwd.dll` / `hxfs_ff.dll` (Windows) or `.so` (Unix). Copy next to `helix` (or into the game dir). The host searches `{exe_dir}`, `{exe_dir}/{game}`, `{game}`, `.`.
 
 WAD lumps are lowercase virtual paths (`maps/e1m1/things`, `textures/conchars`). PAK/PK3/PK4/IWD keep archive paths (`maps/e1m1.bsp`, `images/loadscreen.iwi`), lowercased, `\\` → `/`. PK3, PK4 and IWD share a ZIP reader (store + deflate). FastFiles (`hxfs_ff`) pick a profile from magic + version (LE or BE): extra header size, zlib vs 64KiB raw-deflate blocks, IW3 12-byte vs IW4 16-byte rawfiles. Signed `IWffs100` wrappers are skipped (hashes/RSA not verified). Virtual files: `zone.bin`, `ff.profile`, plus scanned rawfiles (`.gsc`, `.cfg`, …). IW4 inner-zlib rawfiles are inflated on read. Later encrypted CoD FFs (IW5+) are not supported. `read()` returns raw (inflated) bytes.

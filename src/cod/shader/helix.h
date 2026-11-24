@@ -26,6 +26,8 @@ int shader_source_to_helix(const void* data, size_t size,
 /* surfaceparm nodraw/caulk/hint/skip/portal names, filled while shaders are read. */
 void shader_note_invisible(const CodShaderFile* file);
 int shader_is_invisible(const char* name);
+const char* shader_skybox(const char* name);
+const char* shader_sunfile(const char* name);
 
 #ifdef __cplusplus
 }

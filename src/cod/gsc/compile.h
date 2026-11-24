@@ -20,6 +20,15 @@ extern "C" {
 
 /* Returns 1 and fills prog. Caller frees with gsc_prog_free. */
 int gsc_compile(const char* source, size_t size, GscProg* prog);
+int gsc_compile_runtime(const char* source, size_t size, GscProg* prog);
+typedef struct GscCompileDiagnostic {
+    size_t offset;
+    unsigned line, column;
+    char message[192];
+} GscCompileDiagnostic;
+typedef struct GscCompileOptions { int developer; } GscCompileOptions;
+int gsc_compile_runtime_options(const char* source, size_t size, GscProg* prog,
+                                const GscCompileOptions* options, GscCompileDiagnostic* diagnostic);
 void gsc_prog_free(GscProg* prog);
 
 #ifdef __cplusplus

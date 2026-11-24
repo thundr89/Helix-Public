@@ -32,6 +32,7 @@
 
 typedef struct {
     char vname[ZIP_VNAME_MAX];
+    unsigned int local_ofs;
     unsigned int data_ofs;
     unsigned int csize;
     unsigned int usize;
@@ -42,8 +43,11 @@ typedef struct {
 struct ZipFile {
     unsigned char* bytes;
     size_t length;
+    FILE* fp;
     ZipEntry* files;
     int count;
+    int* hash_table;
+    unsigned int hash_mask;
 };
 
 static unsigned int zip_rd_u16(const unsigned char* p) {
@@ -64,6 +68,14 @@ static int zip_ascii_eq(const char* a, const char* b) {
         if (tolower(ca) != tolower(cb)) return 0;
     }
     return *a == 0 && *b == 0;
+}
+
+static unsigned int zip_hash_str(const char* s) {
+    unsigned int h = 2166136261u;
+    while (*s) {
+        h = (h ^ (unsigned char)*s++) * 16777619u;
+    }
+    return h;
 }
 
 static void zip_normalize(char* dst, size_t dstsz, const char* src, size_t srclen) {
@@ -90,6 +102,15 @@ static int zip_find_last(const ZipFile* p, const char* name) {
     if (!p || !name) return -1;
     zip_normalize(key, sizeof(key), name, strlen(name));
     if (!key[0]) return -1;
+    if (p->hash_table && p->hash_mask) {
+        unsigned int h = zip_hash_str(key) & p->hash_mask;
+        while (p->hash_table[h] != -1) {
+            int idx = p->hash_table[h];
+            if (strcmp(p->files[idx].vname, key) == 0) return idx;
+            h = (h + 1u) & p->hash_mask;
+        }
+        return -1;
+    }
     for (i = p->count - 1; i >= 0; i--) {
         if (zip_ascii_eq(p->files[i].vname, key)) return i;
     }
@@ -97,6 +118,10 @@ static int zip_find_last(const ZipFile* p, const char* name) {
 }
 
 static int zip_is_last_occurrence(const ZipFile* p, int idx) {
+    if (p->hash_table && p->hash_mask) {
+        int last = zip_find_last(p, p->files[idx].vname);
+        return last == idx;
+    }
     int j;
     for (j = idx + 1; j < p->count; j++) {
         if (zip_ascii_eq(p->files[j].vname, p->files[idx].vname)) return 0;
@@ -128,6 +153,9 @@ static int zip_find_eocd(const unsigned char* bytes, size_t len, size_t* out_ofs
     }
     return 0;
 }
+
+static int zip_eocd_in_tail(const unsigned char* tail, size_t tail_n, size_t file_n, size_t* abs_ofs);
+static int zip_add_cd(ZipFile* p, const unsigned char* cd, unsigned int cd_size, unsigned int num);
 
 static int zip_inflate_raw(const unsigned char* src, unsigned int src_len,
                            unsigned char* dst, unsigned int dst_len) {
@@ -231,6 +259,26 @@ static ZipFile* zip_parse_owned(unsigned char* bytes, size_t len) {
     }
 
     p->count = out;
+    if (out > 0) {
+        unsigned int cap = 16;
+        while (cap < (unsigned int)out * 2u) cap <<= 1;
+        p->hash_mask = cap - 1u;
+        p->hash_table = (int*)malloc(cap * sizeof(int));
+        if (p->hash_table) {
+            unsigned int k;
+            for (k = 0; k < cap; k++) p->hash_table[k] = -1;
+            for (i = 0; i < (unsigned int)out; i++) {
+                unsigned int h = zip_hash_str(p->files[i].vname) & p->hash_mask;
+                while (p->hash_table[h] != -1) {
+                    if (strcmp(p->files[p->hash_table[h]].vname, p->files[i].vname) == 0) {
+                        break;
+                    }
+                    h = (h + 1u) & p->hash_mask;
+                }
+                p->hash_table[h] = (int)i;
+            }
+        }
+    }
     return p;
 }
 
@@ -246,8 +294,11 @@ ZipFile* zip_open_mem(const void* bytes, size_t len) {
 ZipFile* zip_open_file(const char* path) {
     FILE* f;
     long sz;
-    unsigned char* buf;
-    size_t n;
+    size_t tail_n, eocd;
+    unsigned char* tail = NULL;
+    unsigned char* cd = NULL;
+    ZipFile* p;
+    unsigned int disk, start_disk, num_here, num, cd_size, cd_ofs;
 
     if (!path || !path[0]) return NULL;
     f = fopen(path, "rb");
@@ -257,30 +308,170 @@ ZipFile* zip_open_file(const char* path) {
         return NULL;
     }
     sz = ftell(f);
-    if (sz < 0) {
+    if (sz < 22) {
         fclose(f);
         return NULL;
     }
-    if (fseek(f, 0, SEEK_SET) != 0) {
+    tail_n = (size_t)sz < 65557u ? (size_t)sz : 65557u;
+    if (fseek(f, (long)((size_t)sz - tail_n), SEEK_SET) != 0) {
         fclose(f);
         return NULL;
     }
-    buf = (unsigned char*)malloc(sz > 0 ? (size_t)sz : 1);
-    if (!buf) {
+    tail = (unsigned char*)malloc(tail_n);
+    if (!tail || fread(tail, 1, tail_n, f) != tail_n || !zip_eocd_in_tail(tail, tail_n, (size_t)sz, &eocd)) {
+        free(tail);
         fclose(f);
         return NULL;
     }
-    n = fread(buf, 1, (size_t)sz, f);
-    fclose(f);
-    if (n != (size_t)sz) {
+    disk = zip_rd_u16(tail + (eocd - ((size_t)sz - tail_n)) + 4);
+    start_disk = zip_rd_u16(tail + (eocd - ((size_t)sz - tail_n)) + 6);
+    num_here = zip_rd_u16(tail + (eocd - ((size_t)sz - tail_n)) + 8);
+    num = zip_rd_u16(tail + (eocd - ((size_t)sz - tail_n)) + 10);
+    cd_size = zip_rd_u32(tail + (eocd - ((size_t)sz - tail_n)) + 12);
+    cd_ofs = zip_rd_u32(tail + (eocd - ((size_t)sz - tail_n)) + 16);
+    free(tail);
+    if (disk != 0 || start_disk != 0 || num_here != num || num == 0xFFFFu || cd_ofs == 0xFFFFFFFFu ||
+        cd_size == 0xFFFFFFFFu || (size_t)cd_ofs + (size_t)cd_size > (size_t)sz) {
+        fclose(f);
+        return NULL;
+    }
+    cd = (unsigned char*)malloc(cd_size ? cd_size : 1);
+    if (!cd || fseek(f, (long)cd_ofs, SEEK_SET) != 0 || (cd_size && fread(cd, 1, cd_size, f) != cd_size)) {
+        free(cd);
+        fclose(f);
+        return NULL;
+    }
+    p = (ZipFile*)calloc(1, sizeof(ZipFile));
+    if (!p || !zip_add_cd(p, cd, cd_size, num)) {
+        free(cd);
+        if (p) zip_close(p);
+        fclose(f);
+        return NULL;
+    }
+    free(cd);
+    p->fp = f;
+    p->length = (size_t)sz;
+    return p;
+}
+
+static int zip_eocd_in_tail(const unsigned char* tail, size_t tail_n, size_t file_n, size_t* abs_ofs) {
+    size_t base;
+    size_t i;
+    size_t min_i;
+    if (!tail || tail_n < 22 || file_n < tail_n) return 0;
+    base = file_n - tail_n;
+    min_i = (tail_n - 22 > 65535u) ? (tail_n - 22 - 65535u) : 0;
+    i = tail_n - 22;
+    for (;;) {
+        if (zip_rd_u32(tail + i) == ZIP_SIG_EOCD) {
+            unsigned int comment = zip_rd_u16(tail + i + 20);
+            if (base + i + 22u + comment == file_n) {
+                *abs_ofs = base + i;
+                return 1;
+            }
+        }
+        if (i == min_i) break;
+        i--;
+    }
+    return 0;
+}
+
+static void zip_index(ZipFile* p) {
+    unsigned int cap = 16;
+    unsigned int i;
+    unsigned int k;
+    if (p->count <= 0) return;
+    while (cap < (unsigned int)p->count * 2u) cap <<= 1;
+    p->hash_mask = cap - 1u;
+    p->hash_table = (int*)malloc(cap * sizeof(int));
+    if (!p->hash_table) return;
+    for (k = 0; k < cap; k++) p->hash_table[k] = -1;
+    for (i = 0; i < (unsigned int)p->count; i++) {
+        unsigned int h = zip_hash_str(p->files[i].vname) & p->hash_mask;
+        while (p->hash_table[h] != -1) {
+            if (strcmp(p->files[p->hash_table[h]].vname, p->files[i].vname) == 0) break;
+            h = (h + 1u) & p->hash_mask;
+        }
+        p->hash_table[h] = (int)i;
+    }
+}
+
+/* Central directory only. Local headers are checked when a member is read. */
+static int zip_add_cd(ZipFile* p, const unsigned char* cd, unsigned int cd_size, unsigned int num) {
+    unsigned int i;
+    size_t cur = 0;
+    int out = 0;
+    if (num > ZIP_MAX_FILES) return 0;
+    p->files = (ZipEntry*)calloc((size_t)num + 1u, sizeof(ZipEntry));
+    if (num > 0 && !p->files) return 0;
+    for (i = 0; i < num; i++) {
+        unsigned int flag, method, crc, csize, usize;
+        unsigned int namelen, extralen, commentlen, local_ofs;
+        const unsigned char* fname;
+        ZipEntry* E;
+        size_t nlen;
+        if (cur + 46 > cd_size) return 0;
+        if (zip_rd_u32(cd + cur) != ZIP_SIG_CENTRAL) return 0;
+        flag = zip_rd_u16(cd + cur + 8);
+        method = zip_rd_u16(cd + cur + 10);
+        crc = zip_rd_u32(cd + cur + 16);
+        csize = zip_rd_u32(cd + cur + 20);
+        usize = zip_rd_u32(cd + cur + 24);
+        namelen = zip_rd_u16(cd + cur + 28);
+        extralen = zip_rd_u16(cd + cur + 30);
+        commentlen = zip_rd_u16(cd + cur + 32);
+        local_ofs = zip_rd_u32(cd + cur + 42);
+        if (cur + 46 + namelen + extralen + commentlen > cd_size) return 0;
+        fname = cd + cur + 46;
+        cur += 46u + namelen + extralen + commentlen;
+        if (flag & 1u) continue;
+        if (method != ZIP_METHOD_STORE && method != ZIP_METHOD_DEFLATE) continue;
+        if (csize == 0xFFFFFFFFu || usize == 0xFFFFFFFFu || local_ofs == 0xFFFFFFFFu) continue;
+        if (usize > ZIP_MAX_UNCOMP) continue;
+        if (namelen == 0 || namelen >= ZIP_VNAME_MAX) continue;
+        if (method == ZIP_METHOD_STORE && csize != usize) continue;
+        E = &p->files[out];
+        memset(E, 0, sizeof(*E));
+        zip_normalize(E->vname, sizeof(E->vname), (const char*)fname, namelen);
+        nlen = strlen(E->vname);
+        if (!nlen || E->vname[nlen - 1] == '/') continue;
+        E->local_ofs = local_ofs;
+        E->csize = csize;
+        E->usize = usize;
+        E->crc = crc;
+        E->method = method;
+        out++;
+    }
+    p->count = out;
+    zip_index(p);
+    return 1;
+}
+
+static int zip_load_comp(const ZipFile* p, const ZipEntry* E, unsigned char** out) {
+    unsigned char hdr[30];
+    unsigned int namelen, extralen;
+    unsigned char* buf;
+    if (!p->fp || !E || !out) return 0;
+    if (fseek(p->fp, (long)E->local_ofs, SEEK_SET) != 0) return 0;
+    if (fread(hdr, 1, 30, p->fp) != 30) return 0;
+    if (zip_rd_u32(hdr) != ZIP_SIG_LOCAL) return 0;
+    namelen = zip_rd_u16(hdr + 26);
+    extralen = zip_rd_u16(hdr + 28);
+    if (fseek(p->fp, (long)namelen + (long)extralen, SEEK_CUR) != 0) return 0;
+    buf = (unsigned char*)malloc(E->csize ? E->csize : 1);
+    if (!buf) return 0;
+    if (E->csize && fread(buf, 1, E->csize, p->fp) != E->csize) {
         free(buf);
-        return NULL;
+        return 0;
     }
-    return zip_parse_owned(buf, (size_t)sz);
+    *out = buf;
+    return 1;
 }
 
 void zip_close(ZipFile* p) {
     if (!p) return;
+    if (p->fp) fclose(p->fp);
+    free(p->hash_table);
     free(p->bytes);
     free(p->files);
     free(p);
@@ -302,6 +493,7 @@ int zip_checksum(const ZipFile* p, const char* name, unsigned int* crc) {
 int zip_read(const ZipFile* p, const char* name, unsigned char** out_buf, unsigned int* out_size) {
     int idx;
     unsigned char* buf;
+    unsigned char* comp = NULL;
     const ZipEntry* E;
     const unsigned char* src;
     if (!p || !out_buf || !out_size) return 0;
@@ -310,13 +502,23 @@ int zip_read(const ZipFile* p, const char* name, unsigned char** out_buf, unsign
     E = &p->files[idx];
     buf = (unsigned char*)malloc(E->usize ? E->usize : 1);
     if (!buf) return 0;
-    src = p->bytes + E->data_ofs;
+    if (p->fp) {
+        if (!zip_load_comp(p, E, &comp)) {
+            free(buf);
+            return 0;
+        }
+        src = comp;
+    } else {
+        src = p->bytes + E->data_ofs;
+    }
     if (E->method == ZIP_METHOD_STORE) {
         if (E->usize) memcpy(buf, src, E->usize);
     } else if (!zip_inflate_raw(src, E->csize, buf, E->usize)) {
+        free(comp);
         free(buf);
         return 0;
     }
+    free(comp);
     if (crc32(0L, buf, E->usize) != E->crc) {
         free(buf);
         return 0;

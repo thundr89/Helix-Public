@@ -1,5 +1,7 @@
+#include <stdio.h>
 /*
- * CoD .shader text to Helix .mtr (albedo_map points at the PNG path).
+ * CoD .shader text to Helix .mtr. Image paths keep their extension.
+ * Extensionless names stay extensionless so the host probes .dds first.
  * Copyright (C) 2026 Helix-Public contributors
  *
  * This program is free software; you can redistribute it and/or modify
@@ -16,6 +18,10 @@
 #define INVISIBLE_MAX 256
 static char g_invisible[INVISIBLE_MAX][128];
 static int g_invisible_n = 0;
+static char g_sky_names[256][128],g_sky_boxes[256][128],g_sun_files[256][128];static int g_sky_count;
+const char* shader_skybox(const char* name){int i;for(i=0;i<g_sky_count;i++)if(!strcmp(name,g_sky_names[i]))return g_sky_boxes[i];return "";}
+
+const char* shader_sunfile(const char* name){int i;for(i=0;i<g_sky_count;i++)if(!strcmp(name,g_sky_names[i]))return g_sun_files[i];return "";}
 
 void shader_note_invisible(const CodShaderFile* file) {
     int i;
@@ -23,6 +29,10 @@ void shader_note_invisible(const CodShaderFile* file) {
     for (i = 0; i < file->count; i++) {
         int k;
         int seen = 0;
+        if(file->shaders[i].skybox[0]){
+            for(k=0;k<g_sky_count;k++)if(!strcmp(g_sky_names[k],file->shaders[i].name))break;
+            if(k<256){snprintf(g_sky_names[k],128,"%s",file->shaders[i].name);snprintf(g_sky_boxes[k],128,"%s",file->shaders[i].skybox);snprintf(g_sun_files[k],128,"%s",file->shaders[i].sunfile);if(k==g_sky_count)g_sky_count++;}
+        }
         if (!file->shaders[i].invisible || !file->shaders[i].name[0]) continue;
         for (k = 0; k < g_invisible_n; k++) {
             if (strcmp(g_invisible[k], file->shaders[i].name) == 0) {
@@ -53,24 +63,13 @@ static int decal_name(const char* name) {
     return 1;
 }
 
-static void png_path(const char* in, char* out, size_t cap) {
-    size_t i, n;
+static void image_path(const char* in, char* out, size_t cap) {
+    size_t i;
     if (!out || cap == 0) return;
     out[0] = '\0';
     if (!in) return;
     for (i = 0; in[i] && i + 1 < cap; i++) out[i] = (in[i] == '\\') ? '/' : in[i];
     out[i] = '\0';
-    n = i;
-    if (n >= 4) {
-        char* e = out + n - 4;
-        if (cod_strcasecmp(e, ".tga") == 0 || cod_strcasecmp(e, ".dds") == 0 || cod_strcasecmp(e, ".jpg") == 0 ||
-            cod_strcasecmp(e, ".png") == 0) {
-            memcpy(e, ".png", 4);
-            return;
-        }
-    }
-    /* CoD shaders usually omit the extension: textures/mp/foo */
-    if (n + 4 < cap) memcpy(out + n, ".png", 5);
 }
 
 int shader_to_helix(const CodShaderFile* file, unsigned char** out_buf, unsigned int* out_size) {
@@ -85,7 +84,7 @@ int shader_to_helix(const CodShaderFile* file, unsigned char** out_buf, unsigned
         int blend;
         int decal;
         if (!s->name[0]) continue;
-        png_path(s->image[0] ? s->image : s->name, image, sizeof(image));
+        image_path(s->image[0] ? s->image : s->name, image, sizeof(image));
         if (!s->image[0] && strncmp(s->name, "textures/", 9) != 0 && strncmp(s->name, "gfx/", 4) != 0)
             image[0] = '\0';
         blend = s->blend;
@@ -108,6 +107,22 @@ int shader_to_helix(const CodShaderFile* file, unsigned char** out_buf, unsigned
             if (s->has_uv_xform &&
                 !cod_emit_fmt(&e, "  uvTransform %.9g %.9g %.9g %.9g %.9g %.9g\n", s->uv_xform[0], s->uv_xform[1],
                               s->uv_xform[2], s->uv_xform[3], s->uv_xform[4], s->uv_xform[5])) {
+                cod_emit_free(&e);
+                return 0;
+            }
+            if ((s->uv_scroll[0] != 0.f || s->uv_scroll[1] != 0.f) &&
+                !cod_emit_fmt(&e, "  uvScroll %.9g %.9g\n", s->uv_scroll[0], s->uv_scroll[1])) {
+                cod_emit_free(&e);
+                return 0;
+            }
+            if (s->uv_rotate != 0.f &&
+                !cod_emit_fmt(&e, "  uvRotate %.9g\n", s->uv_rotate)) {
+                cod_emit_free(&e);
+                return 0;
+            }
+            if (s->uv_turb[1] != 0.f &&
+                !cod_emit_fmt(&e, "  uvTurb %.9g %.9g %.9g %.9g\n", s->uv_turb[0], s->uv_turb[1],
+                              s->uv_turb[2], s->uv_turb[3])) {
                 cod_emit_free(&e);
                 return 0;
             }

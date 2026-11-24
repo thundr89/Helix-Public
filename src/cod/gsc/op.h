@@ -35,16 +35,27 @@ typedef enum GscOp {
     GSC_JUMP_BACK, /* a = absolute instruction index; counts as a back edge for fuel */
     GSC_FAR,       /* a = path string index, b = function name string index, str = argc */
     GSC_THREAD,    /* local: same as GSC_CALL (str = -1). far: str >= 0, a and b are path and name string indexes, str is argc */
-    GSC_STOP       /* end this branch; the thread's caller continues */
+    GSC_GET_GLOBAL, GSC_WAIT, GSC_METHOD, GSC_EVENT_ARG, GSC_ENTITY_CALL, GSC_ENTITY_FAR, GSC_ENTITY_THREAD,
+    GSC_DIAGNOSTIC, GSC_FUNC_REF, GSC_FAR_REF, GSC_INDIRECT, GSC_NOT,
+    GSC_STOP,      /* end this branch; the thread's caller continues */
+    GSC_PUSH_ISTR, /* localized string key; remains distinct from a plain string */
+    GSC_VECTOR,   /* pops z, y, x and pushes a vector value */
+    GSC_NEG, GSC_BITAND, GSC_BITOR, GSC_BITXOR,
+    GSC_NOP, GSC_POP, GSC_DUP, GSC_DUP2, GSC_MOD, GSC_BITNOT,
+    GSC_SHL, GSC_SHR, GSC_LE, GSC_GE,
+    GSC_IMPORT, GSC_NAMED_CALL, GSC_NAMED_REF, GSC_ANIMATION, GSC_ANIMTREE,
+    GSC_CAST_INT, GSC_CAST_FLOAT, GSC_CAST_STRING, GSC_CAST_BOOL, GSC_FRAME_END,
+    GSC_NATIVE_SLOT, GSC_INTRINSIC_CALL, GSC_INTRINSIC_METHOD
 } GscOp;
 
-enum { GSC_BU_GIVE = 1, GSC_BU_TAKE, GSC_BU_AMBIENT, GSC_BU_GAMETYPE, GSC_BU_ALLIES, GSC_BU_AXIS, GSC_BU_STRUCT };
+enum { GSC_BU_GIVE = 1, GSC_BU_TAKE, GSC_BU_AMBIENT, GSC_BU_GAMETYPE, GSC_BU_ALLIES, GSC_BU_AXIS, GSC_BU_STRUCT, GSC_BU_PC_MODEL, GSC_BU_PC_SOUND, GSC_BU_PC_SHADER, GSC_BU_PC_WEAPON, GSC_BU_LOAD_FX, GSC_BU_SET_CVAR, GSC_BU_GETENT, GSC_BU_GETENTARRAY, GSC_BU_DEFINED, GSC_BU_GETCVAR, GSC_BU_GETCVARINT, GSC_BU_GETCVARFLOAT };
 
 typedef struct GscIns {
     unsigned char op;
     int a, b;
     int str; /* string-table index, argc for GSC_FAR and far GSC_THREAD, or -1 */
     double f;
+    unsigned line, column; /* Strict frontend emission site; legacy compiler: 0. */
 } GscIns;
 
 typedef struct GscFunc {
@@ -63,6 +74,9 @@ typedef struct GscProg {
     int* stroff;
     int nstr, scap;
     int fuel;
+    /* Lazily constructed runtime interning index; private to the adapter. */
+    int* strhash;
+    int hashcap, strbytes, bytecap;
 } GscProg;
 
 #ifdef __cplusplus

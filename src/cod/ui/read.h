@@ -21,12 +21,17 @@ typedef struct CodUiAction {
     char cmd[32];
     char arg1[128];
     char arg2[128];
+    char arg3[512];
 } CodUiAction;
+
+typedef struct CodUiChoice {char label[256],value[128];} CodUiChoice;
 
 typedef struct CodUiItem {
     char name[64];
     char type[64];
-    char text[160];
+    CodUiChoice* choices;int nchoices;
+    int max_chars;
+    char text[1024];
     char image[160];
     char textalign[32];
     char feeder[80];
@@ -35,6 +40,7 @@ typedef struct CodUiItem {
     char cvar_test[64];
     char show_cvar[64];
     char hide_cvar[64];
+    char disable_cvar[64],enable_cvar[64];
     char group[64];
     float origin[2];
     int has_origin;
@@ -45,6 +51,7 @@ typedef struct CodUiItem {
     float textalignx;
     float textaligny;
     int has_text_anchor;
+    float range_default;
     float range_min;
     float range_max;
     int has_range;
@@ -55,6 +62,9 @@ typedef struct CodUiItem {
     float focuscolor[4];
     int has_focuscolor;
     int decoration;
+    int autowrapped;
+    int visible;
+    int has_visible;
     CodUiAction* actions;
     int nactions;
     CodUiAction* on_focus;
@@ -62,6 +72,12 @@ typedef struct CodUiItem {
     CodUiAction* on_leave;
     int n_on_leave;
 } CodUiItem;
+
+typedef struct CodUiKey {
+    char key[16];
+    CodUiAction* actions;
+    int count;
+} CodUiKey;
 
 typedef struct CodUiMenu {
     char name[64];
@@ -72,8 +88,14 @@ typedef struct CodUiMenu {
     int visible;
     int has_visible;
     char background[160];
+    float focuscolor[4];
+    int has_focuscolor;
     CodUiAction* on_open;
     int n_on_open;
+    CodUiAction* on_close;
+    int n_on_close;
+    CodUiKey* keys;
+    int nkeys;
     CodUiAction* on_esc;
     int n_on_esc;
     CodUiItem* items;

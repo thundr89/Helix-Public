@@ -1,3 +1,4 @@
+#include <stdio.h>
 /*
  * CoD1 .shader text. One file holds many shader definitions.
  * Copyright (C) 2026 Helix-Public contributors
@@ -85,6 +86,8 @@ int shader_read(const void* data, size_t size, CodShaderFile* out) {
     int depth = 0;
     int have_pending = 0;
     int perlight = 0;
+    int base_chosen = 0;
+    int stage_has_image = 0;
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
     if (!data || size == 0) return 0;
@@ -107,10 +110,13 @@ int shader_read(const void* data, size_t size, CodShaderFile* out) {
                 out->shaders[out->count++] = s;
                 have_pending = 0;
             }
+            if (depth == 0) base_chosen = 0;
+            if (depth == 1) { perlight = 0; stage_has_image = 0; }
             depth++;
             continue;
         }
         if (strcmp(tok, "}") == 0) {
+            if (depth == 2 && stage_has_image) base_chosen = 1;
             if (depth > 0) depth--;
             /* A stage ends when the shader body (depth 1) is visible again. */
             if (depth < 2) perlight = 0;
@@ -135,7 +141,8 @@ int shader_read(const void* data, size_t size, CodShaderFile* out) {
                 if (!take_token(&p, end, image, sizeof(image))) break;
             }
             /* A gameplay map replaces qer_editorimage. */
-            if (useful_image(image)) {
+            if (useful_image(image) && !base_chosen && !perlight) {
+                stage_has_image = 1;
                 strncpy(s->image, image, sizeof(s->image) - 1);
                 s->image[sizeof(s->image) - 1] = '\0';
             }
@@ -147,6 +154,13 @@ int shader_read(const void* data, size_t size, CodShaderFile* out) {
                 strncpy(s->image, image, sizeof(s->image) - 1);
                 s->image[sizeof(s->image) - 1] = '\0';
             }
+        } else if(out->count>0 && strcmp(tok,"sunfile")==0) {
+            take_token(&p,end,out->shaders[out->count-1].sunfile,128);
+        } else if(out->count>0 && strcmp(tok,"skyParms")==0) {
+            char base[128],discard[128];CodShader* s=&out->shaders[out->count-1];
+            if(!take_token(&p,end,base,sizeof(base)))break;
+            take_token(&p,end,discard,sizeof(discard));take_token(&p,end,discard,sizeof(discard));
+            if(strcmp(base,"-")!=0)snprintf(s->skybox,sizeof(s->skybox),"%s",base);
         } else if (out->count > 0 && strcmp(tok, "surfaceparm") == 0) {
             char parm[64];
             CodShader* s = &out->shaders[out->count - 1];
@@ -161,7 +175,7 @@ int shader_read(const void* data, size_t size, CodShaderFile* out) {
             /* `blend` and `add` are single tokens. GL_SRC_ALPHA takes a second. */
             if (strncmp(a, "GL_", 3) == 0) take_token(&p, end, b, sizeof(b));
             /* A perlight add lights the surface. It is not the base blend. */
-            if (perlight) continue;
+            if (perlight || base_chosen) continue;
             if (strcmp(a, "add") == 0 || (strcmp(a, "GL_ONE") == 0 && strcmp(b, "GL_ONE") == 0))
                 s->blend = 2;
             /* `filter` and GL_DST_COLOR multiply a lightmap onto the diffuse. Nothing
@@ -174,6 +188,7 @@ int shader_read(const void* data, size_t size, CodShaderFile* out) {
             char fn[64];
             CodShader* s = &out->shaders[out->count - 1];
             if (!take_token(&p, end, fn, sizeof(fn))) break;
+            if (base_chosen || perlight) continue;
             if (strcmp(fn, "GE128") == 0 || strcmp(fn, "GT128") == 0) s->alpha_test = 0.5f;
             else if (strcmp(fn, "GT0") == 0 || strcmp(fn, "GE0") == 0) s->alpha_test = 0.004f;
         } else if (out->count > 0 && strcmp(tok, "perlight") == 0) {
@@ -190,6 +205,39 @@ int shader_read(const void* data, size_t size, CodShaderFile* out) {
                     s->uv_xform[k] = (float)strtod(num, NULL);
                 }
                 if (k == 6) s->has_uv_xform = 1;
+            } else if (strcmp(kind, "scroll") == 0) {
+                char s_val[32], t_val[32];
+                if (take_token(&p, end, s_val, sizeof(s_val)) && take_token(&p, end, t_val, sizeof(t_val))) {
+                    s->uv_scroll[0] = (float)strtod(s_val, NULL);
+                    s->uv_scroll[1] = (float)strtod(t_val, NULL);
+                }
+            } else if (strcmp(kind, "rotate") == 0) {
+                char deg_val[32];
+                if (take_token(&p, end, deg_val, sizeof(deg_val))) {
+                    s->uv_rotate = (float)strtod(deg_val, NULL);
+                }
+            } else if (strcmp(kind, "scale") == 0) {
+                char s_val[32], t_val[32];
+                if (take_token(&p, end, s_val, sizeof(s_val)) && take_token(&p, end, t_val, sizeof(t_val))) {
+                    if (!s->has_uv_xform) {
+                        s->uv_xform[0] = (float)strtod(s_val, NULL);
+                        s->uv_xform[1] = 0.f;
+                        s->uv_xform[2] = 0.f;
+                        s->uv_xform[3] = (float)strtod(t_val, NULL);
+                        s->uv_xform[4] = 0.f;
+                        s->uv_xform[5] = 0.f;
+                        s->has_uv_xform = 1;
+                    }
+                }
+            } else if (strcmp(kind, "turb") == 0) {
+                char t0[32], t1[32], t2[32], t3[32];
+                if (take_token(&p, end, t0, sizeof(t0)) && take_token(&p, end, t1, sizeof(t1)) &&
+                    take_token(&p, end, t2, sizeof(t2)) && take_token(&p, end, t3, sizeof(t3))) {
+                    s->uv_turb[0] = (float)strtod(t0, NULL);
+                    s->uv_turb[1] = (float)strtod(t1, NULL);
+                    s->uv_turb[2] = (float)strtod(t2, NULL);
+                    s->uv_turb[3] = (float)strtod(t3, NULL);
+                }
             }
         } else if (out->count > 0 && strcmp(tok, "polygonOffset") == 0) {
             out->shaders[out->count - 1].polygon_offset = 1;

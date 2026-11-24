@@ -18,8 +18,13 @@
 extern "C" {
 #endif
 
+int cod_weapon_catalog(const CodArchive*,unsigned char**,unsigned*);
+int cod_weapon_view_exists(const CodArchive*,const char*);
+int cod_weapon_view_checksum(const CodArchive*,const char*,unsigned*);
+int cod_weapon_view_file(const CodArchive*,const char*,unsigned char**,unsigned*);
 int xmodel_to_helix(const CodArchive* ar, const char* name,
                     unsigned char** out_buf, unsigned int* out_size);
+int xmodel_lod_to_helix(const CodArchive*,const char*,int lod,unsigned char**,unsigned*);
 
 /* Helix gameplay mesh path -> xmodel/<name>, or NULL when it is not one of those.
  * models/player.obj uses the body from cod_set_player_body when one is set. */
@@ -36,3 +41,5 @@ int cod_viewhand_file(const CodArchive* ar, unsigned char** out_buf, unsigned in
 #endif
 
 #endif /* XMODEL_HELIX_H */
+
+int cod_model_tags(const CodArchive* ar, const char* model, unsigned char** out, unsigned int* size);

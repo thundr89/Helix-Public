@@ -118,7 +118,10 @@ static int take_string(Lex* l, char* out, size_t cap) {
     l->p++;
     while (l->p < l->end && *l->p != '"') {
         char c = *l->p++;
-        if (c == '\\' && l->p < l->end) c = *l->p++;
+        if (c == '\\' && l->p < l->end) {
+            c=*l->p++;
+            if(c=='n')c='\n';else if(c=='r')c='\r';else if(c=='t')c='\t';
+        }
         if (n + 1 < cap) out[n++] = c;
     }
     if (l->p < l->end && *l->p == '"') l->p++;
@@ -290,6 +293,7 @@ static int parse_actions(Lex* l, CodUiAction** list, int* count) {
             skip_value(l);
             continue;
         }
+        lower_inplace(cmd);
         memset(&a, 0, sizeof(a));
         snprintf(a.cmd, sizeof(a.cmd), "%s", cmd);
         if (strcmp(cmd, "open") == 0 || strcmp(cmd, "close") == 0 ||
@@ -305,6 +309,13 @@ static int parse_actions(Lex* l, CodUiAction** list, int* count) {
                 continue;
             }
             if (!push_action(list, count, &a)) return 0;
+        } else if(key_eq(cmd,"execOnCvarIntValue") || key_eq(cmd,"execOnCvarFloatValue") || key_eq(cmd,"execOnCvarStringValue")) {
+            float number;
+            if(!take_string_or_ident(l,a.arg1,sizeof(a.arg1)))return 0;
+            if(take_number(l,&number))snprintf(a.arg2,sizeof(a.arg2),"%g",number);
+            else if(!take_string_or_ident(l,a.arg2,sizeof(a.arg2)))return 0;
+            if(!take_string_or_ident(l,a.arg3,sizeof(a.arg3)))return 0;
+            if(!push_action(list,count,&a))return 0;
         } else if (strcmp(cmd, "setcvar") == 0 || strcmp(cmd, "set") == 0) {
             float num;
             char ident[64];
@@ -362,9 +373,10 @@ static int parse_item(Lex* l, CodUiItem* item) {
         char key[64];
         skip(l);
         if (take_punct(l, '}')) {
-            if (item->has_origin && item->has_rect) {
+            if (item->has_origin) {
                 item->rect[0] += item->origin[0];
                 item->rect[1] += item->origin[1];
+                item->has_rect = 1;
             }
             return 1;
         }
@@ -395,10 +407,28 @@ static int parse_item(Lex* l, CodUiItem* item) {
             }
         } else if (strcmp(key, "cvar") == 0) {
             if (!take_string_or_ident(l, item->cvar, sizeof(item->cvar))) return 0;
+        } else if(strcmp(key,"cvarstrlist")==0 || strcmp(key,"cvarfloatlist")==0) {
+            if(!take_punct(l,'{'))return 0;
+            while(!take_punct(l,'}')) {
+                if(take_punct(l,',') || take_punct(l,';'))continue;
+                CodUiChoice choice;CodUiChoice* grown;memset(&choice,0,sizeof(choice));
+                if(item->nchoices>=128 || !take_string_or_ident(l,choice.label,sizeof(choice.label)))return 0;
+                while(take_punct(l,',') || take_punct(l,';')){}
+                if(strcmp(key,"cvarfloatlist")==0){float value;if(!take_number(l,&value))return 0;snprintf(choice.value,sizeof(choice.value),"%g",value);}
+                else if(!take_string_or_ident(l,choice.value,sizeof(choice.value)))return 0;
+                grown=(CodUiChoice*)realloc(item->choices,(item->nchoices+1)*sizeof(*grown));if(!grown)return 0;
+                item->choices=grown;item->choices[item->nchoices++]=choice;
+            }
+        } else if(strcmp(key,"maxchars")==0) {
+            float value;if(!take_number(l,&value) || value<1 || value>4096)return 0;item->max_chars=(int)value;
         } else if (strcmp(key, "cvartest") == 0) {
             if (!take_string_or_ident(l, item->cvar_test, sizeof(item->cvar_test))) return 0;
         } else if (strcmp(key, "showcvar") == 0) {
             if (!take_cvar_list(l, item->show_cvar, sizeof(item->show_cvar))) return 0;
+        } else if (!strcmp(key,"disablecvar")) {
+            if(!take_cvar_list(l,item->disable_cvar,sizeof(item->disable_cvar)))return 0;
+        } else if (!strcmp(key,"enablecvar")) {
+            if(!take_cvar_list(l,item->enable_cvar,sizeof(item->enable_cvar)))return 0;
         } else if (strcmp(key, "hidecvar") == 0) {
             if (!take_cvar_list(l, item->hide_cvar, sizeof(item->hide_cvar))) return 0;
         } else if (strcmp(key, "group") == 0) {
@@ -435,6 +465,7 @@ static int parse_item(Lex* l, CodUiItem* item) {
             float def = 0, mn = 0, mx = 0;
             if (!take_string_or_ident(l, item->cvar, sizeof(item->cvar))) return 0;
             if (take_number(l, &def) && take_number(l, &mn) && take_number(l, &mx)) {
+                item->range_default = def;
                 item->range_min = mn;
                 item->range_max = mx;
                 item->has_range = 1;
@@ -472,6 +503,11 @@ static int parse_item(Lex* l, CodUiItem* item) {
                 }
             }
             if (i == 4) item->has_focuscolor = 1;
+        } else if (strcmp(key, "visible") == 0) {
+            float visible = 1;
+            if (take_number(l, &visible)) { item->visible = visible != 0; item->has_visible = 1; }
+        } else if (strcmp(key, "autowrapped") == 0) {
+            item->autowrapped = 1;
         } else if (strcmp(key, "decoration") == 0) {
             item->decoration = 1;
         } else if (strcmp(key, "onfocus") == 0 || strcmp(key, "mouseenter") == 0) {
@@ -486,6 +522,8 @@ static int parse_item(Lex* l, CodUiItem* item) {
     }
 }
 
+static void free_item(CodUiItem* item){free(item->actions);free(item->on_focus);free(item->on_leave);free(item->choices);}
+static void free_menu(CodUiMenu* menu){int i;free(menu->on_open);free(menu->on_close);free(menu->on_esc);for(i=0;i<menu->nkeys;i++)free(menu->keys[i].actions);free(menu->keys);for(i=0;i<menu->nitems;i++)free_item(&menu->items[i]);free(menu->items);}
 static int parse_menu(Lex* l, CodUiMenu* menu) {
     memset(menu, 0, sizeof(*menu));
     if (!take_punct(l, '{')) return 0;
@@ -500,6 +538,10 @@ static int parse_menu(Lex* l, CodUiMenu* menu) {
         } else if (strcmp(key, "rect") == 0) {
             if (!parse_rect(l, menu->rect)) return 0;
             menu->has_rect = 1;
+        } else if (strcmp(key, "focuscolor") == 0) {
+            int i;
+            for (i = 0; i < 4; ++i) if (!take_number(l, &menu->focuscolor[i])) return 0;
+            menu->has_focuscolor = 1;
         } else if (strcmp(key, "fullscreen") == 0) {
             int on = 0;
             if (!take_boolish(l, &on)) return 0;
@@ -513,13 +555,23 @@ static int parse_menu(Lex* l, CodUiMenu* menu) {
         } else if (strcmp(key, "itemdef") == 0) {
             CodUiItem item;
             CodUiItem* grown;
-            if (!parse_item(l, &item)) return 0;
+            if (!parse_item(l, &item)) {free_item(&item);return 0;}
             grown = (CodUiItem*)realloc(menu->items, (size_t)(menu->nitems + 1) * sizeof(CodUiItem));
-            if (!grown) return 0;
+            if (!grown) {free_item(&item);return 0;}
             menu->items = grown;
             menu->items[menu->nitems++] = item;
         } else if (strcmp(key, "onopen") == 0) {
             if (!parse_actions(l, &menu->on_open, &menu->n_on_open)) return 0;
+        } else if (strcmp(key, "onclose") == 0) {
+            if (!parse_actions(l, &menu->on_close, &menu->n_on_close)) return 0;
+        } else if (strcmp(key, "execkey") == 0) {
+            CodUiKey binding; CodUiKey* grown;
+            memset(&binding, 0, sizeof(binding));
+            if (!take_string_or_ident(l, binding.key, sizeof(binding.key)) ||
+                !parse_actions(l, &binding.actions, &binding.count)) return 0;
+            grown = (CodUiKey*)realloc(menu->keys, (menu->nkeys + 1) * sizeof(CodUiKey));
+            if (!grown) { free(binding.actions); return 0; }
+            menu->keys = grown; menu->keys[menu->nkeys++] = binding;
         } else if (strcmp(key, "onesc") == 0) {
             if (!parse_actions(l, &menu->on_esc, &menu->n_on_esc)) return 0;
         } else if (strcmp(key, "background") == 0) {
@@ -549,11 +601,13 @@ int ui_read(const void* data, size_t size, CodUiFile* out) {
             CodUiMenu menu;
             CodUiMenu* grown;
             if (!parse_menu(&lex, &menu)) {
+                free_menu(&menu);
                 ui_read_free(out);
                 return 0;
             }
             grown = (CodUiMenu*)realloc(out->menus, (size_t)(out->nmenus + 1) * sizeof(CodUiMenu));
             if (!grown) {
+                free_menu(&menu);
                 ui_read_free(out);
                 return 0;
             }
@@ -572,10 +626,14 @@ void ui_read_free(CodUiFile* file) {
         CodUiMenu* m = &file->menus[i];
         free(m->on_open);
         free(m->on_esc);
+        free(m->on_close);
+        for (j = 0; j < m->nkeys; j++) free(m->keys[j].actions);
+        free(m->keys);
         for (j = 0; j < m->nitems; j++) {
             free(m->items[j].actions);
             free(m->items[j].on_focus);
             free(m->items[j].on_leave);
+            free(m->items[j].choices);
         }
         free(m->items);
     }

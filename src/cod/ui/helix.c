@@ -32,6 +32,8 @@ static const char* item_type(const char* cod) {
         return "label";
     if (cod_strcasecmp(cod, "ITEM_TYPE_BUTTON") == 0 || cod_strcasecmp(cod, "button") == 0 || strcmp(cod, "1") == 0)
         return "button";
+    if (cod_strcasecmp(cod, "ITEM_TYPE_NUMERICFIELD") == 0 || strcmp(cod, "9") == 0) return "numericfield";
+    if(cod_strcasecmp(cod,"ITEM_TYPE_EDITFIELD")==0 || cod_strcasecmp(cod,"editfield")==0 || strcmp(cod,"4")==0)return "editfield";
     if (cod_strcasecmp(cod, "ITEM_TYPE_CHECKBOX") == 0 || cod_strcasecmp(cod, "ITEM_TYPE_YESNO") == 0 ||
         cod_strcasecmp(cod, "checkbox") == 0 || strcmp(cod, "2") == 0 || strcmp(cod, "3") == 0 ||
         strcmp(cod, "11") == 0)
@@ -45,7 +47,7 @@ static const char* item_type(const char* cod) {
     if (cod_strcasecmp(cod, "ITEM_TYPE_OWNERDRAW") == 0 || cod_strcasecmp(cod, "ownerdraw") == 0 || strcmp(cod, "8") == 0)
         return "button";
     if (cod_strcasecmp(cod, "ITEM_TYPE_MULTI") == 0 || cod_strcasecmp(cod, "multi") == 0 || strcmp(cod, "12") == 0)
-        return "listbox";
+        return "multi";
     if (cod_strcasecmp(cod, "ITEM_TYPE_BIND") == 0 || cod_strcasecmp(cod, "bind") == 0 || strcmp(cod, "13") == 0)
         return "button";
     return NULL;
@@ -67,6 +69,12 @@ static const char* uiscript_exec(const char* name) {
     if (!name || !name[0]) return NULL;
     if (cod_strcasecmp(name, "quit") == 0) return "quit";
     if (cod_strcasecmp(name, "runmod") == 0) return "load_mod";
+    if (!cod_strcasecmp(name,"loadArenas"))return "vote_menu_refresh";
+    if (!cod_strcasecmp(name,"voteMap"))return "ui_vote map";
+    if (!cod_strcasecmp(name,"voteTypeMap"))return "ui_vote typemap";
+    if (!cod_strcasecmp(name,"voteKick"))return "ui_vote clientkick";
+    if (!cod_strcasecmp(name,"voteTempBan"))return "ui_vote tempbanuser";
+
     return NULL;
 }
 
@@ -86,6 +94,7 @@ static const char* action_cmd(const char* cod) {
     if (cod_strcasecmp(cod, "close") == 0) return "close";
     if (cod_strcasecmp(cod, "play") == 0) return "play";
     if (cod_strcasecmp(cod, "exec") == 0) return "exec";
+    if (cod_strcasecmp(cod,"execOnCvarIntValue")==0 || cod_strcasecmp(cod,"execOnCvarFloatValue")==0 || cod_strcasecmp(cod,"execOnCvarStringValue")==0)return "conditional";
     if (cod_strcasecmp(cod, "toggle") == 0 || cod_strcasecmp(cod, "togglecvar") == 0) return "toggle";
     if (cod_strcasecmp(cod, "stopmusic") == 0) return "stopmusic";
     if (cod_strcasecmp(cod, "ingameopen") == 0) return "ingameopen";
@@ -97,15 +106,22 @@ static const char* action_cmd(const char* cod) {
     return NULL;
 }
 
-/* set only reaches cvars the host actually stores. volume is the host's s_volume. */
+/* Translate host aliases; preserve valid game/mod cvars. */
 static const char* set_cvar(const char* name) {
     if (!name || !name[0]) return NULL;
-    if (cod_strcasecmp(name, "volume") == 0 || cod_strcasecmp(name, "s_volume") == 0 ||
-        cod_strcasecmp(name, "mss_volume") == 0)
+    if(!cod_strcasecmp(name,"ui_r_picmip"))return "r_picmip";
+    if(!cod_strcasecmp(name,"ui_r_picmip2"))return "r_picmip2";
+    if(!cod_strcasecmp(name,"ui_r_texturemode"))return "r_texturemode";
+    if(!cod_strcasecmp(name,"ui_r_texturebits"))return "r_texturebits";
+    if(!cod_strcasecmp(name,"ui_r_nv_fog_dist"))return "r_nv_fog_dist";
+    if(!cod_strcasecmp(name,"ui_mss_khz"))return "s_khz";
+    if(!cod_strcasecmp(name,"ui_mss_3d_provider"))return "s_provider";
+    if (cod_strcasecmp(name, "volume") == 0 || cod_strcasecmp(name, "mss_volume") == 0 || cod_strcasecmp(name, "s_volume") == 0)
         return "s_volume";
-    if (cod_strcasecmp(name, "s_musicvolume") == 0 || cod_strcasecmp(name, "mss_musicvolume") == 0)
+    if (cod_strcasecmp(name, "mss_musicvolume") == 0 || cod_strcasecmp(name, "s_musicvolume") == 0)
         return "s_musicvolume";
     if (cod_strcasecmp(name, "s_musicloop") == 0) return "s_musicloop";
+    if (cod_strcasecmp(name, "cl_bypassMouseInput") == 0) return "cl_bypassMouseInput";
     if (cod_strcasecmp(name, "sensitivity") == 0) return "sensitivity";
     if (cod_strcasecmp(name, "m_invert") == 0 || cod_strcasecmp(name, "ui_mousePitch") == 0) return "m_invert";
     if (cod_strcasecmp(name, "g_gametype") == 0) return "g_gametype";
@@ -126,7 +142,9 @@ static const char* set_cvar(const char* name) {
     if (cod_strcasecmp(name, "fov") == 0 || cod_strcasecmp(name, "cg_fov") == 0) return "fov";
     if (cod_strcasecmp(name, "sv_hostname") == 0) return "sv_hostname";
     if (cod_strcasecmp(name, "sv_maxclients") == 0) return "sv_maxclients";
-    return NULL;
+    {const unsigned char* c=(const unsigned char*)name;
+     for(;*c;c++)if(!isalnum(*c) && *c!='_' && *c!='.')return NULL;}
+    return name;
 }
 
 static int starts_ci(const char* s, const char* prefix) {
@@ -187,6 +205,32 @@ const char* ui_loc_find(const char* key) {
     return NULL;
 }
 
+
+static int loc_emit_quoted(CodEmit* e,const char* text) {
+    if(!cod_emit_add(e,"\""))return 0;
+    for(;*text;text++) {
+        char buf[3]={0,0,0};
+        if(*text=='"'||*text=='\\'){buf[0]='\\';buf[1]=*text;}
+        else if(*text=='\n'){buf[0]='\\';buf[1]='n';}
+        else if(*text=='\r'){buf[0]='\\';buf[1]='r';}
+        else if(*text=='\t'){buf[0]='\\';buf[1]='t';}
+        else buf[0]=*text;
+        if(!cod_emit_add(e,buf))return 0;
+    }
+    return cod_emit_add(e,"\"");
+}
+int ui_loc_export(unsigned char** out,unsigned int* size) {
+    CodEmit e;int i;
+    const char* aliases[2][2]={{"hint.use_turret","CGAME_USEMG42"},{"hint.pickup_weapon","CGAME_PICKUPNEWWEAPON"}};
+    if(!out||!size||!cod_emit_init(&e))return 0;
+    for(i=0;i<g_loc_n+2;i++) {
+        const char* key=i<g_loc_n?g_loc[i].key:aliases[i-g_loc_n][0];
+        const char* value=i<g_loc_n?g_loc[i].value:ui_loc_find(aliases[i-g_loc_n][1]);
+        if(!value)continue;
+        if(!loc_emit_quoted(&e,key)||!cod_emit_add(&e," ")||!loc_emit_quoted(&e,value)||!cod_emit_add(&e,"\n")){cod_emit_free(&e);return 0;}
+    }
+    return cod_emit_take(&e,out,size);
+}
 static int loc_store(const char* key, const char* value) {
     char k[192];
     int i;
@@ -230,7 +274,7 @@ static int line_quoted(const char* s, const char* end, char* out, size_t cap) {
     s++;
     while (s < end && *s != '"' && *s != '\n' && *s != '\r') {
         char c = *s++;
-        if (c == '\\' && s < end) c = *s++;
+        if (c == '\\' && s < end) { c = *s++; if (c == 'n') c = '\n'; else if (c == 't') c = '\t'; }
         if (n + 1 < cap) out[n++] = c;
     }
     out[n] = '\0';
@@ -304,10 +348,11 @@ static void pretty_menu_text(const char* in, char* out, size_t cap) {
     out[i] = '\0';
 }
 
-static int emit_actions(CodEmit* e, const char* key, const CodUiAction* actions, int count, const char* indent) {
+static int emit_actions(CodEmit* e, const char* key, const CodUiAction* actions, int count, const char* indent, const char* menu) {
     int i;
-    int any = 0;
-    if (count <= 0) return 1;
+    int save=!strcmp(key,"onClose") && menu && starts_ci(menu,"options_");
+    int any = save;
+    if (count <= 0 && !save) return 1;
     for (i = 0; i < count; i++) {
         if (is_script_response(actions[i].cmd)) {
             any = 1;
@@ -338,27 +383,20 @@ static int emit_actions(CodEmit* e, const char* key, const CodUiAction* actions,
     for (i = 0; i < count; i++) {
         const char* cmd;
         if (is_script_response(actions[i].cmd)) {
-            const char* arg = actions[i].arg1;
-            if (cod_strcasecmp(arg, "allies") == 0) {
-                if (!cod_emit_add(e, " exec \"team allies\" ; open \"weapon_american\" ;")) return 0;
-            } else if (cod_strcasecmp(arg, "axis") == 0) {
-                if (!cod_emit_add(e, " exec \"team axis\" ; open \"weapon_german\" ;")) return 0;
-            } else if (cod_strcasecmp(arg, "autoassign") == 0) {
-                if (!cod_emit_add(e, " exec \"team autoassign\" ;")) return 0;
-            } else if (cod_strcasecmp(arg, "spectator") == 0) {
-                if (!cod_emit_add(e, " exec \"team spectator\" ;")) return 0;
-            } else if (cod_strcasecmp(arg, "close") == 0 || cod_strcasecmp(arg, "open") == 0) {
-                /* lifecycle response */
-            } else {
-                char wcmd[160];
-                snprintf(wcmd, sizeof(wcmd), " exec \"weapon %s\" ;", arg);
-                if (!cod_emit_add(e, wcmd)) return 0;
-            }
+            CodEmit command;int ok;if(!cod_emit_init(&command))return 0;
+            ok=cod_emit_add(&command,"menuresponse ") && loc_emit_quoted(&command,menu) && cod_emit_add(&command," ") && loc_emit_quoted(&command,actions[i].arg1);
+            if(ok)ok=cod_emit_add(e," exec ") && loc_emit_quoted(e,command.data) && cod_emit_add(e," ;");
+            cod_emit_free(&command);if(!ok)return 0;
             continue;
         }
         if (is_uiscript(actions[i].cmd)) {
             if (actions[i].arg1 && cod_strcasecmp(actions[i].arg1, "startserver") == 0) {
-                if (!cod_emit_add(e, " open \"map_select\" ; exec \"map\" ; close \"createserver\" ; close \"createserver_maps\" ; close \"createserver_op\" ;")) return 0;
+                int mode;
+                for(mode=0;mode<3;mode++){
+                    char command[96];snprintf(command,sizeof(command),"exec_if_int ui_dedicated %d \"start_server %d\"",mode,mode);
+                    if(!cod_emit_add(e," exec ") || !loc_emit_quoted(e,command) || !cod_emit_add(e," ;"))return 0;
+                }
+                if(!cod_emit_add(e," close \"createserver\" ; close \"createserver_maps\" ; close \"createserver_op\" ;"))return 0;
                 continue;
             }
             const char* ex = uiscript_exec(actions[i].arg1);
@@ -368,6 +406,15 @@ static int emit_actions(CodEmit* e, const char* key, const CodUiAction* actions,
         }
         cmd = action_cmd(actions[i].cmd);
         if (!cmd) continue;
+        if(!strcmp(cmd,"conditional")) {
+            CodEmit command;int ok;
+            if(!cod_emit_init(&command))return 0;
+            ok=cod_emit_add(&command,cod_strcasecmp(actions[i].cmd,"execOnCvarIntValue")==0?"exec_if_int ":!cod_strcasecmp(actions[i].cmd,"execOnCvarFloatValue")?"exec_if_float ":"exec_if_string ") &&
+               loc_emit_quoted(&command,actions[i].arg1) && cod_emit_add(&command," ") &&
+               loc_emit_quoted(&command,actions[i].arg2) && cod_emit_add(&command," ") && loc_emit_quoted(&command,actions[i].arg3);
+            if(ok)ok=cod_emit_add(e," exec ") && loc_emit_quoted(e,command.data) && cod_emit_add(e," ;");
+            cod_emit_free(&command);if(!ok)return 0;continue;
+        }
         if (strcmp(cmd, "set") == 0 || strcmp(cmd, "toggle") == 0) {
             const char* cvar = set_cvar(actions[i].arg1);
             if (!cvar) continue;
@@ -381,6 +428,7 @@ static int emit_actions(CodEmit* e, const char* key, const CodUiAction* actions,
             if (!cod_emit_fmt(e, " %s \"%s\" ;", cmd, actions[i].arg1)) return 0;
         }
     }
+    if(save && !cod_emit_add(e," exec \"writeconfig\" ;"))return 0;
     return cod_emit_add(e, " }\n");
 }
 
@@ -423,7 +471,8 @@ static const char* helix_bind(const char* cvar) {
     if (strcmp(cvar, "+moveleft") == 0) return "left";
     if (strcmp(cvar, "+moveright") == 0) return "right";
     if (strcmp(cvar, "+moveup") == 0 || strcmp(cvar, "+gostand") == 0) return "jump";
-    if (strcmp(cvar, "+movedown") == 0) return "crouch";
+    if (!strcmp(cvar,"+movedown") || !strcmp(cvar,"gocrouch"))return "crouch";
+    if (!strcmp(cvar,"+prone") || !strcmp(cvar,"goprone"))return "prone";
     if (strcmp(cvar, "+attack") == 0) return "attack";
     if (strcmp(cvar, "+reload") == 0) return "reload";
     if (strcmp(cvar, "weaponslot primary") == 0) return "weap1";
@@ -432,28 +481,42 @@ static const char* helix_bind(const char* cvar) {
     return NULL;
 }
 
-static int emit_option_row(CodEmit* e, const char* name, const char* type, float y, const char* text,
-                           const char* cvar, const char* exec_cmd) {
-    if (!cod_emit_fmt(e,
-                      "    itemDef {\n"
-                      "        name \"%s\"\n"
-                      "        type %s\n"
-                      "        rect 5 %g 350 13\n"
-                      "        text \"%s\"\n"
-                      "        textscale 0.225\n"
-                      "        textalign right\n"
-                      "        textalignx 185\n"
-                      "        textaligny 11\n"
-                      "        forecolor 0.9 0.9 0.9 1\n",
-                      name, type, y, text))
-        return 0;
-    if (cvar && cvar[0] && !cod_emit_fmt(e, "        cvar \"%s\"\n", cvar)) return 0;
-    if (exec_cmd && exec_cmd[0] && !cod_emit_fmt(e, "        action { exec \"%s\" ; }\n", exec_cmd)) return 0;
-    return cod_emit_add(e, "    }\n");
+static int emit_option_row(CodEmit* e,const CodUiItem* source,const char* name,float y,const char* text,const char* cvar,const char* choices,int scrollable) {
+    float x=source?source->rect[0]:5,w=source?source->rect[2]:350,h=source?source->rect[3]:13;
+    float height=source && source->has_textscale?64*source->textscale:14.4f;
+    float dx=source && source->has_text_anchor?source->textalignx:185,dy=source && source->has_text_anchor?source->textaligny:11;
+    if(!cod_emit_fmt(e,"    itemDef { name \"%s\" type multi rect %g %g %g %g text \"%s\" cvar \"%s\" textHeight %g textalign right textalignx %g textaligny %g forecolor .9 .9 .9 1 scrollable %d customLabel \"Custom\" choices { %s } action { show graphicsapply ; show applysystem ; } }\n",name,x,y,w,h,text,cvar,height,dx,dy,scrollable,choices))return 0;
+    return 1;
 }
-
+/* Only stock renderer controls known to have no Helix consumer belong here.
+ * Unknown mod cvars must keep their normal binding and actions. */
+static const char* stock_graphics_status(const char* menu,const CodUiItem* it) {
+    const char* c=it->cvar;
+    if(!strcmp(menu,"options_graphics")) {
+        if(!strcmp(c,"r_ext_compressed_textures"))return "Automatic";
+        if(!strcmp(c,"ui_glCustom"))return "Manual";
+        if(!strcmp(c,"r_allowExtensions") || !strcmp(c,"r_vertexlight") ||
+           !strcmp(c,"r_ati_pntriangles") || !strcmp(it->text,"@MENU_SET_RECOMMENDED"))return "Unavailable";
+    }
+    if(!strcmp(menu,"options_performance") &&
+       (!strcmp(c,"r_fastsky") || !strcmp(c,"cg_skybox") ||
+        !strcmp(c,"ai_corpsecount") || !strcmp(c,"cg_coronafardist") ||
+        !strcmp(c,"cg_wolfparticles")))return "Unavailable";
+    return NULL;
+}
+static int emit_stock_graphics_status(CodEmit* e,const CodUiItem* it,int index,const char* status,int scrollable) {
+    char label[1024];
+    float dx=it->has_text_anchor?it->textalignx:185,dy=it->has_text_anchor?it->textaligny:11;
+    float height=it->has_textscale?64*it->textscale:14.4f;
+    pretty_menu_text(it->text,label,sizeof(label));
+    if(!cod_emit_fmt(e,"    itemDef { name hx_legacy_label_%d type label rect %g %g %g %g text ",index,it->rect[0],it->rect[1],it->rect[2],it->rect[3]) ||
+       !loc_emit_quoted(e,label) ||
+       !cod_emit_fmt(e," textHeight %g textalign right textalignx %g textaligny %g forecolor .6 .6 .6 1 decoration 1 scrollable %d }\n",height,dx,dy,scrollable))return 0;
+    return cod_emit_fmt(e,"    itemDef { name hx_legacy_value_%d type label rect %g %g %g %g text \"%s\" textHeight %g textalign left textalignx %g textaligny %g forecolor .6 .6 .6 1 decoration 1 scrollable %d }\n",index,it->rect[0],it->rect[1],it->rect[2],it->rect[3],status,height,dx+12,dy,scrollable);
+}
 static const char* map_feeder(const char* raw) {
     if (!raw || !raw[0]) return NULL;
+    if(!cod_strcasecmp(raw,"FEEDER_PLAYER_LIST") || !strcmp(raw,"0x0b") || !strcmp(raw,"11"))return "players";
     if (cod_strcasecmp(raw, "FEEDER_ALLMAPS") == 0 || cod_strcasecmp(raw, "FEEDER_MAPS") == 0 ||
         strcmp(raw, "0x04") == 0 || strcmp(raw, "0x4") == 0 || strcmp(raw, "4") == 0 ||
         strcmp(raw, "0x01") == 0 || strcmp(raw, "0x1") == 0 || strcmp(raw, "1") == 0)
@@ -462,6 +525,75 @@ static const char* map_feeder(const char* raw) {
         strcmp(raw, "9") == 0)
         return "codmods";
     return NULL;
+}
+
+static int emit_graphics_status_menu(CodEmit* e,const CodUiMenu* source) {
+    static const struct {const char* key;const char* label;} features[]={
+        {"texture_storage","Texture storage"},{"texture_filtering","Texture filtering"},
+        {"normal_mapping","Normal mapping"},{"surface_relief","Surface relief"},
+        {"pbr","Dynamic PBR lighting"},{"shadows","Shadows"},{"msaa","MSAA"},
+        {"post_aa","Post-process anti-aliasing"},{"hdr","HDR scene"},
+        {"ibl","Environment lighting"},{"ssao","Ambient occlusion"},
+        {"bloom","Bloom"},{"gpu_timing","GPU timing"}
+    };
+    unsigned i;float y=48;
+    if(!cod_emit_fmt(e,"menuDef { name options_graphics_status codStyle 1 rect %g %g 360 325 onESC { open options_graphics ; }\n",source->has_rect?source->rect[0]:5,source->has_rect?source->rect[1]:75) ||
+       !cod_emit_add(e," itemDef { name background type label rect 0 0 360 325 backcolor 0 0 0 .9 decoration 1 }\n"
+        " itemDef { name title type label rect 8 4 344 20 text \"Graphics Status\" textHeight 16 forecolor .9 .9 .9 1 decoration 1 }\n"
+        " itemDef { name note type label rect 8 24 344 20 text \"Requests may need Apply; effective values describe the renderer.\" textHeight 10 textWrap 1 forecolor .7 .7 .7 1 decoration 1 }\n"
+        " itemDef { name renderer_title type label rect 8 48 344 18 text \"Renderer\" textHeight 14 forecolor .9 .75 .4 1 decoration 1 scrollable 1 }\n"
+        " itemDef { name renderer_request type label rect 8 68 344 28 cvar ui_renderer_requested prefix \"Requested: \" textHeight 11 textWrap 1 forecolor .8 .8 .8 1 decoration 1 scrollable 1 }\n"
+        " itemDef { name renderer_effective type label rect 8 97 344 28 cvar ui_renderer_effective prefix \"Effective: \" textHeight 11 textWrap 1 forecolor .8 .8 .8 1 decoration 1 scrollable 1 }\n"
+        " itemDef { name renderer_reason type label rect 8 126 344 64 cvar ui_renderer_reason textHeight 10 textWrap 1 forecolor .65 .65 .65 1 decoration 1 scrollable 1 }\n"))return 0;
+    y+=148;
+    for(i=0;i<sizeof(features)/sizeof(features[0]);i++){
+        if(!cod_emit_fmt(e," itemDef { name feature_%u type label rect 8 %g 344 18 text \"%s\" textHeight 14 forecolor .9 .75 .4 1 decoration 1 scrollable 1 }\n",i,y,features[i].label) ||
+           !cod_emit_fmt(e," itemDef { name request_%u type label rect 8 %g 344 28 cvar ui_gfx_%s_requested prefix \"Requested: \" textHeight 11 textWrap 1 forecolor .8 .8 .8 1 decoration 1 scrollable 1 }\n",i,y+20,features[i].key) ||
+           !cod_emit_fmt(e," itemDef { name effective_%u type label rect 8 %g 344 28 cvar ui_gfx_%s_effective prefix \"Effective: \" textHeight 11 textWrap 1 forecolor .8 .8 .8 1 decoration 1 scrollable 1 }\n",i,y+49,features[i].key) ||
+           !cod_emit_fmt(e," itemDef { name reason_%u type label rect 8 %g 344 64 cvar ui_gfx_%s_reason textHeight 10 textWrap 1 forecolor .65 .65 .65 1 decoration 1 scrollable 1 }\n",i,y+78,features[i].key))return 0;
+        y+=148;
+    }
+    return cod_emit_fmt(e," scrollRegion 48 285 %g\n itemDef { name back type button rect 112.5 295 100 20 text \"Back\" textHeight 16 textalign center forecolor .9 .9 .9 1 action { open options_graphics ; } }\n}\n",y);
+}
+
+
+static const CodArchive* g_gametype_archive;
+void ui_menu_set_gametype_archive(const CodArchive* archive) { g_gametype_archive=archive; }
+static int gametype_name_compare(const void* a,const void* b) {
+    return cod_strcasecmp(*(const char* const*)a,*(const char* const*)b);
+}
+static int emit_gametype_choices(CodEmit* e) {
+    char** names=NULL; unsigned count=0,i; int ok=1;
+    if(!g_gametype_archive)return 1;
+    cod_archive_list(g_gametype_archive,&names,&count);
+    if(count>1)qsort(names,count,sizeof(*names),gametype_name_compare);
+    ok=cod_emit_add(e,"        choices { ");
+    for(i=0;ok && i<count;i++) {
+        const char* n=names[i];const char* base;size_t len,j;
+        char id[128],path[256],key[256];const char* label;
+        unsigned char* raw=NULL;unsigned size=0;
+        if(!starts_ci(n,"maps/mp/gametypes/"))continue;
+        base=n+18;len=strlen(base);
+        if(base[0]=='_' || len<=4 || len-4>=sizeof(id) || strchr(base,'/') || strchr(base,'\\') || cod_strcasecmp(base+len-4,".gsc"))continue;
+        for(j=0;j<len-4;j++)if(!isalnum((unsigned char)base[j]) && base[j]!='_' && base[j]!='-')break;
+        if(j!=len-4)continue;
+        memcpy(id,base,len-4);id[len-4]=0;
+        for(j=0;id[j];j++)id[j]=(char)tolower((unsigned char)id[j]);
+        snprintf(path,sizeof(path),"maps/mp/gametypes/%s.txt",id);
+        snprintf(key,sizeof(key),"%s",id);
+        if(cod_archive_read(g_gametype_archive,path,&raw,&size)) {
+            size_t pos=0,k=0;int quoted;
+            while(pos<size && isspace(raw[pos]))pos++;
+            if(pos<size && raw[pos]=='&')pos++;
+            quoted=pos<size && raw[pos]=='"';if(quoted)pos++;
+            while(pos<size && k+1<sizeof(key) && (quoted?raw[pos]!='"':!isspace(raw[pos])))key[k++]=(char)raw[pos++];
+            if(k)key[k]=0;else snprintf(key,sizeof(key),"%s",id);
+        }
+        free(raw);label=ui_loc_find(key[0]=='@'?key+1:key);if(!label || !*label)label=key;
+        ok=loc_emit_quoted(e,id) && cod_emit_add(e," ") && loc_emit_quoted(e,label) && cod_emit_add(e," ");
+    }
+    for(i=0;i<count;i++)free(names[i]);free(names);
+    return ok && cod_emit_add(e,"}\n");
 }
 
 int ui_to_helix(const CodUiFile* menus, unsigned char** out_buf, unsigned int* out_size) {
@@ -473,11 +605,22 @@ int ui_to_helix(const CodUiFile* menus, unsigned char** out_buf, unsigned int* o
     for (i = 0; i < menus->nmenus; i++) {
         const CodUiMenu* m = &menus->menus[i];
         const char* align;
+        int settings_panel=!strcmp(m->name,"options_graphics") || !strcmp(m->name,"options_performance") || !strcmp(m->name,"options_sound");
+        const CodUiItem* option_template=NULL;float next_option_y=80;
+        const float option_top=!strcmp(m->name,"options_performance")?35:65;
+        if(settings_panel)for(j=0;j<m->nitems;j++){
+            const CodUiItem* it=&m->items[j];
+            if(it->cvar[0] && it->has_rect && it->rect[1]>=option_top && it->rect[1]<260 && !it->decoration){
+                if(!option_template && it->has_textscale && it->has_text_anchor)option_template=it;
+                if(it->rect[1]+15>next_option_y)next_option_y=it->rect[1]+15;
+            }
+        }
         if (!cod_emit_add(&e, "menuDef {\n") ||
             !cod_emit_fmt(&e, "    name \"%s\"\n", m->name)) {
             cod_emit_free(&e);
             return 0;
         }
+        if(!cod_emit_add(&e,"    codStyle 1\n")){cod_emit_free(&e);return 0;}
         if (m->has_rect && !cod_emit_fmt(&e, "    rect %g %g %g %g\n",
                                          m->rect[0], m->rect[1], m->rect[2], m->rect[3])) {
             cod_emit_free(&e);
@@ -487,14 +630,29 @@ int ui_to_helix(const CodUiFile* menus, unsigned char** out_buf, unsigned int* o
             cod_emit_free(&e);
             return 0;
         }
+        if ((!cod_strcasecmp(m->name,"main") || starts_ci(m->name,"team_") || starts_ci(m->name,"weapon_") || !cod_strcasecmp(m->name,"viewmap") || !cod_strcasecmp(m->name,"callvote")) &&
+            !cod_emit_add(&e,"    stackGroup cod_session\n")) {cod_emit_free(&e);return 0;}
         if (m->has_visible && !cod_emit_fmt(&e, "    visible %d\n", m->visible ? 1 : 0)) {
             cod_emit_free(&e);
             return 0;
         }
-        if (!emit_actions(&e, "onOpen", m->on_open, m->n_on_open, "    ") ||
-            !emit_actions(&e, "onESC", m->on_esc, m->n_on_esc, "    ")) {
+        if (!emit_actions(&e, "onOpen", m->on_open, m->n_on_open, "    ", m->name) ||
+            !emit_actions(&e, "onESC", m->on_esc, m->n_on_esc, "    ", m->name)) {
             cod_emit_free(&e);
             return 0;
+        }
+        if (!emit_actions(&e, "onClose", m->on_close, m->n_on_close, "    ", m->name)) { cod_emit_free(&e); return 0; }
+        for (j = 0; j < m->nkeys; j++) {
+            char key[48]; snprintf(key, sizeof(key), "execKey \"%s\"", m->keys[j].key);
+            if (!emit_actions(&e, key, m->keys[j].actions, m->keys[j].count, "    ", m->name)) { cod_emit_free(&e); return 0; }
+        }
+        for (j = 0; j < m->nitems; j++) {
+            const char* od = m->items[j].ownerdraw;
+            int id = atoi(od);
+            if (starts_ci(od, "CG_") || (id > 0 && id < 200)) {
+                if (!cod_emit_add(&e, "    hud 1\n")) { cod_emit_free(&e); return 0; }
+                break;
+            }
         }
         if (m->background[0]) {
             float x = 0, y = 0, w = 640, h = 480;
@@ -516,12 +674,28 @@ int ui_to_helix(const CodUiFile* menus, unsigned char** out_buf, unsigned int* o
         }
         for (j = 0; j < m->nitems; j++) {
             const CodUiItem* it = &m->items[j];
+            const char* stock_status=stock_graphics_status(m->name,it);
+            if(stock_status){
+                if(it->has_visible && !it->visible)continue;
+                if(!emit_stock_graphics_status(&e,it,j,stock_status,it->cvar[0] && it->rect[1]>=option_top)){cod_emit_free(&e);return 0;}
+                kept+=2;continue;
+            }
+            if(!strcmp(m->name,"options_move") && (!strcmp(it->cvar,"togglecrouch") || !strcmp(it->cvar,"toggleprone"))){
+                const int prone=!strcmp(it->cvar,"toggleprone");
+                if(!emit_option_row(&e,it,prone?"hx_prone_mode":"hx_crouch_mode",it->rect[1],prone?"Prone Mode:":"Crouch Mode:",prone?"cl_proneToggle":"cl_crouchToggle","\"1\" \"Toggle\" \"0\" \"Hold\"",0)){cod_emit_free(&e);return 0;}
+                kept++;continue;
+            }
+            if(settings_panel && (!strcmp(it->name,"graphicsapply") || !strcmp(it->name,"applysystem")))continue;
+            if(settings_panel){const char* quality_cvar=set_cvar(it->cvar);
+                if(quality_cvar && (!strcmp(quality_cvar,"r_picmip") || !strcmp(quality_cvar,"r_picmip2")))continue;
+            }
             const char* kind = item_type(it->type);
             const char* cvar_name = it->cvar;
             const char* feeder;
+            int gametype = cod_strcasecmp(it->ownerdraw,"UI_NETGAMETYPE")==0 || atoi(it->ownerdraw)==245;
             int preview;
             int fade;
-            char shown[160];
+            char shown[1024];
             char bind_cvar[64];
             char extra_cmd[80];
             char* sp;
@@ -529,7 +703,7 @@ int ui_to_helix(const CodUiFile* menus, unsigned char** out_buf, unsigned int* o
             preview = map_preview_item(it);
             fade = fade_image(it->image);
             feeder = map_feeder(it->feeder);
-            if (preview) kind = "image";
+            if (preview || strcmp(cvar_name, "scr_layoutimage") == 0) kind = "image";
             else if (fade) kind = "label";
             else if (it->image[0] && !it->type[0]) kind = "image";
 
@@ -537,9 +711,12 @@ int ui_to_helix(const CodUiFile* menus, unsigned char** out_buf, unsigned int* o
             if (it->text[0]) {
                 pretty_menu_text(it->text, shown, sizeof(shown));
                 for (sp = shown; *sp; sp++) {
-                    if (*sp == '"' || *sp == '\n' || *sp == '\r') *sp = ' ';
+                    if (*sp == '"' || *sp == '\r') *sp = ' ';
                 }
             }
+            if(!strcmp(m->name,"options_graphics") &&
+               (!cod_strcasecmp(it->cvar,"ui_r_texturebits") || !cod_strcasecmp(it->cvar,"r_texturebits")))
+                snprintf(shown,sizeof(shown),"Texture Color Depth:");
 
             /* Remap CoD specific cvars to Helix engine cvars */
             extra_cmd[0] = '\0';
@@ -547,6 +724,7 @@ int ui_to_helix(const CodUiFile* menus, unsigned char** out_buf, unsigned int* o
             if (preview) cvar_name = "ui_map";
             else if (feeder && strcmp(feeder, "maps") == 0 && !cvar_name[0]) cvar_name = "ui_map";
             else if (feeder && strcmp(feeder, "codmods") == 0) cvar_name = "ui_helix_mod";
+            else if (feeder && !strcmp(feeder,"players"))cvar_name="ui_vote_player";
             if (it->has_rect && it->rect[3] > 0.f && it->rect[3] <= 20.f && shown[0] &&
                 strcmp(kind, "listbox") == 0)
                 kind = "button";
@@ -576,6 +754,22 @@ int ui_to_helix(const CodUiFile* menus, unsigned char** out_buf, unsigned int* o
                 cvar_name = "s_musicvolume";
             }
 
+            {
+                int od = atoi(it->ownerdraw);
+                if (od == 89) { kind = "bar"; cvar_name = "ui_health"; }
+                else if (od == 5 || od == 70) { kind = "label"; cvar_name = "ui_ammo_text"; }
+                else if (od == 81 || od == 82) continue; /* Stock MP HUD shows ammunition rather than a persistent weapon name. */
+                else if (od == 20) { kind = "image"; cvar_name = "ui_stance"; }
+                else if (od == 83) { kind = "image"; cvar_name = "ui_automatic"; }
+                else if (od == 88) kind = "radar";
+                else if (od == 72 || od == 84 || od == 85 || od == 91 || od == 6) kind = "image";
+                else if (od > 0 && od < 200) continue; /* Needs game data that the host does not supply yet. */
+            }
+            if(gametype){kind="multi";cvar_name=!cod_strcasecmp(m->name,"callvote")?"ui_vote_gametype":"g_gametype";}
+            cvar_name=set_cvar(cvar_name);
+            if(!cvar_name)cvar_name="";
+            if(settings_panel && !strcmp(kind,"checkbox"))kind="multi";
+            if (it->decoration && shown[0] && cvar_name[0] && strcmp(kind, "checkbox") == 0) kind = "button";
             kept++;
             if (!cod_emit_add(&e, "    itemDef {\n") ||
                 !cod_emit_fmt(&e, "        name \"%s\"\n", it->name) ||
@@ -591,6 +785,18 @@ int ui_to_helix(const CodUiFile* menus, unsigned char** out_buf, unsigned int* o
                     return 0;
                 }
             }
+            if(settings_panel && it->cvar[0] && it->has_rect && it->rect[1]>=option_top && it->rect[1]<260 && !it->decoration &&
+                !cod_emit_add(&e,"        scrollable 1\n")){cod_emit_free(&e);return 0;}
+            if (it->has_textscale && !cod_emit_fmt(&e, "        textHeight %g\n", 64.f * it->textscale)) { cod_emit_free(&e); return 0; }
+            if (it->autowrapped && !cod_emit_add(&e, "        textWrap 1\n")) { cod_emit_free(&e); return 0; }
+            if (it->has_visible && !cod_emit_fmt(&e, "        visible %d\n", it->visible)) { cod_emit_free(&e); return 0; }
+            if (it->decoration && (strcmp(it->type, "11") == 0 || cod_strcasecmp(it->type, "ITEM_TYPE_YESNO") == 0) &&
+                !cod_emit_add(&e, "        valueYesNo 1\n")) { cod_emit_free(&e); return 0; }
+            if(atoi(it->ownerdraw)==72 && !cod_emit_add(&e,"        cvar \"ui_use_icon\"\n        image \"gfx/icons/hint_usable.dds\"\n        cvarTest \"ui_use_available\"\n        showCvar \"1\"\n")){cod_emit_free(&e);return 0;}
+            if (atoi(it->ownerdraw) == 20 && !cod_emit_add(&e, "        image \"gfx/hud/stance_stand.dds\"\n        choices { \"0\" \"gfx/hud/stance_stand.dds\" \"1\" \"gfx/hud/stance_crouch.dds\" \"2\" \"gfx/hud/stance_prone.dds\" }\n")) { cod_emit_free(&e); return 0; }
+            if (atoi(it->ownerdraw) == 83 && !cod_emit_add(&e, "        image \"gfx/hud/hud@weaponmode_semi.dds\"\n        alternateImage \"gfx/hud/hud@weaponmode_full.dds\"\n")) { cod_emit_free(&e); return 0; }
+            if (atoi(it->ownerdraw) == 84 && !cod_emit_add(&e, "        rotationCvar \"ui_view_yaw\"\n")) { cod_emit_free(&e); return 0; }
+            if (atoi(it->ownerdraw) == 89 && !cod_emit_add(&e, "        min 0\n        max 100\n")) { cod_emit_free(&e); return 0; }
             if (it->group[0] && !cod_emit_fmt(&e, "        group \"%s\"\n", it->group)) {
                 cod_emit_free(&e);
                 return 0;
@@ -625,10 +831,30 @@ int ui_to_helix(const CodUiFile* menus, unsigned char** out_buf, unsigned int* o
                 cod_emit_free(&e);
                 return 0;
             }
+            if (!it->has_text_anchor && (shown[0] || atoi(it->ownerdraw) == 5 || atoi(it->ownerdraw) == 70) && !cod_emit_fmt(&e,
+                "        textalignx 0\n        textaligny 0\n")) { cod_emit_free(&e); return 0; }
             if (feeder && !cod_emit_fmt(&e, "        feeder \"%s\"\n", feeder)) {
                 cod_emit_free(&e);
                 return 0;
             }
+            if(strcmp(kind,"numericfield")==0 && !cod_emit_fmt(&e,"        numeric 1\n        numericRange %d\n",it->has_range)){cod_emit_free(&e);return 0;}
+            if(it->max_chars && !cod_emit_fmt(&e,"        maxChars %d\n",it->max_chars)){cod_emit_free(&e);return 0;}
+            if(gametype && !emit_gametype_choices(&e)){cod_emit_free(&e);return 0;}
+            if(!strcmp(cvar_name,"ui_language")){
+                if(!cod_emit_add(&e,"        choices { \"0\" \"English\" }\n")){cod_emit_free(&e);return 0;}
+            }else if(!strcmp(cvar_name,"s_provider")){
+                if(!cod_emit_add(&e,"        choices { \"OpenAL\" \"OpenAL\" }\n")){cod_emit_free(&e);return 0;}
+            }else if(settings_panel && !strcmp(kind,"multi") && !it->nchoices){
+                if(!cod_emit_add(&e,"        choices { \"0\" \"No\" \"1\" \"Yes\" }\n")){cod_emit_free(&e);return 0;}
+            }else if(!gametype && it->nchoices) {
+                int choice;if(!cod_emit_add(&e,"        choices { ")){cod_emit_free(&e);return 0;}
+                for(choice=0;choice<it->nchoices;choice++) {
+                    char label[1024];pretty_menu_text(it->choices[choice].label,label,sizeof(label));
+                    if(!loc_emit_quoted(&e,it->choices[choice].value)||!cod_emit_add(&e," ")||!loc_emit_quoted(&e,label)||!cod_emit_add(&e," ")){cod_emit_free(&e);return 0;}
+                }
+                if(!cod_emit_add(&e,"}\n")){cod_emit_free(&e);return 0;}
+            }
+            if(it->has_range && !cod_emit_fmt(&e,"        cvarDefault \"%.9g\"\n",it->range_default)){cod_emit_free(&e);return 0;}
             if (it->has_range && !cod_emit_fmt(&e, "        min %g\n        max %g\n", it->range_min, it->range_max)) {
                 cod_emit_free(&e);
                 return 0;
@@ -645,11 +871,14 @@ int ui_to_helix(const CodUiFile* menus, unsigned char** out_buf, unsigned int* o
                 cod_emit_free(&e);
                 return 0;
             }
+            if(it->disable_cvar[0] && !cod_emit_fmt(&e,"        disableCvar \"%s\"\n",it->disable_cvar)){cod_emit_free(&e);return 0;}
+            if(it->enable_cvar[0] && !cod_emit_fmt(&e,"        enableCvar \"%s\"\n",it->enable_cvar)){cod_emit_free(&e);return 0;}
             if (it->hide_cvar[0] && !cod_emit_fmt(&e, "        hideCvar \"%s\"\n", it->hide_cvar)) {
                 cod_emit_free(&e);
                 return 0;
             }
-            if (it->has_forecolor && !cod_emit_fmt(&e, "        forecolor %g %g %g %g\n",
+            if (atoi(it->ownerdraw) == 89 && !cod_emit_add(&e, "        forecolor 0.15 0.55 0.08 1\n")) { cod_emit_free(&e); return 0; }
+            if (atoi(it->ownerdraw) != 89 && it->has_forecolor && !cod_emit_fmt(&e, "        forecolor %g %g %g %g\n",
                                                    it->forecolor[0], it->forecolor[1],
                                                    it->forecolor[2], it->forecolor[3])) {
                 cod_emit_free(&e);
@@ -673,6 +902,8 @@ int ui_to_helix(const CodUiFile* menus, unsigned char** out_buf, unsigned int* o
                 cod_emit_free(&e);
                 return 0;
             }
+            if (!it->has_focuscolor && m->has_focuscolor && !cod_emit_fmt(&e,
+                "        focuscolor %g %g %g %g\n", m->focuscolor[0], m->focuscolor[1], m->focuscolor[2], m->focuscolor[3])) { cod_emit_free(&e); return 0; }
             if (it->decoration && !cod_emit_add(&e, "        decoration 1\n")) {
                 cod_emit_free(&e);
                 return 0;
@@ -681,24 +912,51 @@ int ui_to_helix(const CodUiFile* menus, unsigned char** out_buf, unsigned int* o
                 cod_emit_free(&e);
                 return 0;
             }
-            if (!emit_actions(&e, "action", it->actions, it->nactions, "        ") ||
-                !emit_actions(&e, "onFocus", it->on_focus, it->n_on_focus, "        ") ||
-                !emit_actions(&e, "onLeave", it->on_leave, it->n_on_leave, "        ") ||
+            if (!emit_actions(&e, "action", it->actions, it->nactions, "        ", m->name) ||
+                !emit_actions(&e, "onFocus", it->on_focus, it->n_on_focus, "        ", m->name) ||
+                !emit_actions(&e, "onLeave", it->on_leave, it->n_on_leave, "        ", m->name) ||
                 !cod_emit_add(&e, "    }\n")) {
                 cod_emit_free(&e);
                 return 0;
             }
-        }
-        if (strcmp(m->name, "options_graphics") == 0) {
-            /* Helix-only rows, under the CoD graphics list and above Apply. */
-            kept += 4;
-            if (!emit_option_row(&e, "hx_renderer", "button", 215, "Renderer", "r_renderer", "vid_renderer_next") ||
-                !emit_option_row(&e, "hx_borderless", "checkbox", 230, "Borderless Window", "r_borderless", NULL) ||
-                !emit_option_row(&e, "hx_aces", "checkbox", 245, "ACES Tonemapping", "r_aces", NULL) ||
-                !emit_option_row(&e, "hx_falloff", "checkbox", 260, "Physical Light Falloff", "r_physical_falloff", NULL)) {
-                cod_emit_free(&e);
-                return 0;
+            if(atoi(it->ownerdraw)==72){
+                float rect[4];align_preview_rect(m,it,rect);
+                float x=rect[0]+rect[2]+6.f;
+                if(!cod_emit_fmt(&e,"    itemDef { name \"use_hint_text\" type text rect %g %g %g 36 textHeight 12 textWrap 1 cvar \"ui_use_text\" cvarTest \"ui_use_available\" showCvar \"1\" decoration 1 }\n",x,rect[1],x<620.f?620.f-x:20.f)){cod_emit_free(&e);return 0;}
+                kept++;
             }
+        }
+        if(settings_panel){
+            static const struct {const char* menu;const char* name;const char* text;const char* cvar;const char* choices;} rows[]={
+                {"options_graphics","hx_renderer","Renderer:","r_renderer","\"vulkan\" \"Vulkan\" \"opengl\" \"OpenGL\" \"opengl33\" \"OpenGL 3.3\" \"d3d9\" \"Direct3D 9\" \"d3d11\" \"Direct3D 11\" \"d3d12\" \"Direct3D 12\" \"software\" \"Software\""},
+                {"options_graphics","hx_borderless","Borderless Window:","r_borderless","\"0\" \"Off\" \"1\" \"On\""},
+                {"options_graphics","hx_texture_quality","Texture Quality:","ui_textureQuality","\"3\" \"Low\" \"2\" \"Normal\" \"1\" \"High\" \"0\" \"Extra\""},
+                {"options_graphics","hx_msaa","Edge Anti-Aliasing:","r_msaa","\"0\" \"Off\" \"2\" \"Low (2x)\" \"4\" \"Normal (4x)\" \"8\" \"High (8x)\""},
+                {"options_graphics","hx_anisotropy","Anisotropic Filtering:","r_anisotropy","\"0\" \"Off\" \"2\" \"2x\" \"4\" \"4x\" \"8\" \"8x\" \"16\" \"16x\""},
+                {"options_performance","hx_pbr","Dynamic PBR Lighting:","r_pbr","\"0\" \"Off\" \"1\" \"On\""},
+                {"options_performance","hx_aces","ACES Tonemapping:","r_aces","\"0\" \"Off\" \"1\" \"On\""},
+                {"options_performance","hx_falloff","Physical Light Falloff:","r_physical_falloff","\"0\" \"Off\" \"1\" \"On\""},
+                {"options_performance","hx_shadow","Shadow Atlas:","r_shadowAtlas","\"0\" \"Off\" \"1\" \"On\""},
+                {"options_performance","hx_surface_detail","Surface Relief:","r_surfaceDetail","\"0\" \"Off\" \"1\" \"On\""},
+                {"options_performance","hx_bump","Normal Mapping:","r_bumpScale","\"0\" \"Off\" \"1\" \"On\""}
+            };
+            int row;
+            for(row=0;row<(int)(sizeof(rows)/sizeof(rows[0]));row++)if(!strcmp(m->name,rows[row].menu)){
+#ifndef _WIN32
+                if(!strcmp(rows[row].name,"hx_renderer")){
+                    if(!emit_option_row(&e,option_template,rows[row].name,next_option_y,rows[row].text,rows[row].cvar,"\"vulkan\" \"Vulkan\" \"opengl\" \"OpenGL\" \"opengl33\" \"OpenGL 3.3\" \"software\" \"Software\"",1)){cod_emit_free(&e);return 0;}
+                }else
+#endif
+                if(!emit_option_row(&e,option_template,rows[row].name,next_option_y,rows[row].text,rows[row].cvar,rows[row].choices,1)){cod_emit_free(&e);return 0;}
+                next_option_y+=15;kept++;
+            }
+            if(!strcmp(m->name,"options_graphics")){
+                if(!cod_emit_fmt(&e," itemDef { name hx_graphics_status type button rect 8 %g 344 15 text \"Graphics Status...\" textHeight 14 forecolor .9 .9 .9 1 scrollable 1 action { open options_graphics_status ; } }\n",next_option_y)){cod_emit_free(&e);return 0;}
+                next_option_y+=20;kept++;
+            }
+            if(!cod_emit_fmt(&e,"    scrollRegion %g 280 %g\n",option_top,next_option_y+5>280?next_option_y+5:280)){cod_emit_free(&e);return 0;}
+            if(!cod_emit_add(&e,"    itemDef { name graphicsapply type button rect 112.5 295 100 20 text \"Apply\" textHeight 16 textalign center forecolor .9 .9 .9 1 action { exec \"apply_system_settings\" ; } }\n")){cod_emit_free(&e);return 0;}
+            kept++;
         } else if (strcmp(m->name, "options_look") == 0) {
             kept += 1;
             if (!cod_emit_add(&e,
@@ -722,6 +980,8 @@ int ui_to_helix(const CodUiFile* menus, unsigned char** out_buf, unsigned int* o
             cod_emit_free(&e);
             return 0;
         }
+        if(!strcmp(m->name,"options_graphics") && !emit_graphics_status_menu(&e,m)){cod_emit_free(&e);return 0;}
+
     }
     if (kept <= 0 || !cod_emit_take(&e, out_buf, out_size)) {
         cod_emit_free(&e);
@@ -1000,4 +1260,52 @@ int ui_menu_to_helix(const void* data, size_t size,
     ui_read_free(&file);
     free(prepared);
     return ok;
+}
+
+/* Export values only: never execute bindings, exec commands or command strings. */
+int ui_cvar_defaults_from_cfg(const void* data,size_t size,unsigned char** out,unsigned int* out_size) {
+    const char* cursor=(const char*)data;const char* end=cursor?cursor+size:cursor;
+    CodEmit emit;
+    static const char* native[][2]={
+        {"sv_hostname","CoDHost"},{"sv_maxclients","20"},{"sv_minping","0"},{"sv_maxping","0"},
+        {"sv_maxrate","0"},{"sv_pure","1"},{"sv_punkbuster","0"},{"g_password",""},
+        {"ui_dedicated","0"},{"g_allowvote","1"},{"g_allowvotemaprestart","1"},
+        {"g_allowvotemaprotate","1"},{"g_allowvotemap","1"},{"g_allowvotegametype","1"},
+        {"g_allowvotekick","1"},{"g_allowvotetempbanuser","1"}
+    };
+    unsigned i;
+    if(!out || !out_size || (!data && size) || !cod_emit_init(&emit))return 0;
+    while(cursor && cursor<end){
+        const char* next=memchr(cursor,'\n',(size_t)(end-cursor));
+        size_t length=next?(size_t)(next-cursor):(size_t)(end-cursor);
+        char line[1024],cmd[16],name[128],value[768];int offset=0,used=0,valid=1;
+        if(length>=sizeof(line)){cursor=next?next+1:end;continue;}
+        memcpy(line,cursor,length);line[length]=0;cursor=next?next+1:end;
+        if(sscanf(line,"%15s %127s %n",cmd,name,&offset)!=2)continue;
+        if(cod_strcasecmp(cmd,"set") && cod_strcasecmp(cmd,"seta") &&
+           cod_strcasecmp(cmd,"sets") && cod_strcasecmp(cmd,"setu"))continue;
+        {
+            const char* p=line+offset;int quoted=*p=='"';const char* key=set_cvar(name);
+            if(!key)continue;
+            if(quoted)p++;
+            while(*p && used+1<(int)sizeof(value)){
+                if(quoted && *p=='"'){p++;quoted=0;break;}
+                if(!quoted && isspace((unsigned char)*p))break;
+                if(quoted && *p=='\\' && (p[1]=='\\' || p[1]=='"'))p++;
+                value[used++]=*p++;
+            }
+            value[used]=0;
+            if(quoted || used+1==(int)sizeof(value))continue;
+            while(isspace((unsigned char)*p))p++;
+            if(*p && !(p[0]=='/' && p[1]=='/'))valid=0;
+            if(!valid)continue;
+            if(!loc_emit_quoted(&emit,key) || !cod_emit_add(&emit," ") ||
+               !loc_emit_quoted(&emit,value) || !cod_emit_add(&emit,"\n"))goto fail;
+        }
+    }
+    for(i=0;i<sizeof(native)/sizeof(native[0]);i++)
+        if(!loc_emit_quoted(&emit,native[i][0]) || !cod_emit_add(&emit," ") ||
+           !loc_emit_quoted(&emit,native[i][1]) || !cod_emit_add(&emit,"\n"))goto fail;
+    return cod_emit_take(&emit,out,out_size);
+fail:cod_emit_free(&emit);return 0;
 }

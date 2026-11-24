@@ -1,0 +1,4 @@
+map { version 1 name "mg42_test" }
+brush { mins -300 -300 -32 maxs 300 300 0 material "textures/dev/grid" }
+entity { "classname" "info_player_deathmatch" "origin" "-60 0 24.03125" }
+entity { "runtime_only" "1" "render_model" "1" "classname" "misc_mg42" "model" "xmodel/mg42_bipod" "weaponinfo" "mg42_bipod_stand_mp" "origin" "0 0 30" "angles" "0 0 0" }

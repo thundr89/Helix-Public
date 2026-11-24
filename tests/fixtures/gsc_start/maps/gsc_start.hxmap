@@ -1,0 +1,5 @@
+map { version 1 name "gsc_start" title "GSC two-second startup panel" }
+brush { mins -256 -256 -16 maxs 256 256 0 material "textures/dev/grid" }
+brush { mins 40 -48 0 maxs 48 48 96 material "textures/dev/grid" model 1 }
+entity { "classname" "script_brushmodel" "model" "*1" "targetname" "startup_panel" "runtime_only" "1" }
+entity { "classname" "info_player_start" "origin" "-100 0 32" "angle" "0" }
