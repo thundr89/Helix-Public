@@ -492,6 +492,21 @@ if(UNIX)
 endif()
 hx_deploy_module(cs16_sgame cs16)
 
+add_library(cs16_pack SHARED
+    src/cs16/cs16_pack.c)
+target_include_directories(cs16_pack PRIVATE
+    "${HELIX_ENGINE_INCLUDE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/cs16")
+set_target_properties(cs16_pack PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "cs16_pack"
+    C_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON)
+if(UNIX)
+    target_link_libraries(cs16_pack PRIVATE m)
+endif()
+hx_deploy_module(cs16_pack cs16)
+
 add_executable(cs16_mdl_test
     tests/cs16_mdl_test.c
     src/cs16/cs16_mdl.c)
