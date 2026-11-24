@@ -1469,10 +1469,20 @@ static void cs16_init(hxServerGame* self, hxSGEngine* eng, hxSGImports* imp,
         }
     }
 
-    if (strncmp(g->map_name, "de_", 3) == 0) g->mode = MODE_DE;
-    else if (strncmp(g->map_name, "cs_", 3) == 0) g->mode = MODE_CS;
-    else if (strncmp(g->map_name, "as_", 3) == 0) g->mode = MODE_AS;
+    const char* base_map = g->map_name;
+    const char* slash = strrchr(base_map, '/');
+    if (!slash) slash = strrchr(base_map, '\\');
+    if (slash) base_map = slash + 1;
+
+    if (strncmp(base_map, "de_", 3) == 0) g->mode = MODE_DE;
+    else if (strncmp(base_map, "cs_", 3) == 0) g->mode = MODE_CS;
+    else if (strncmp(base_map, "as_", 3) == 0) g->mode = MODE_AS;
     else g->mode = MODE_DE;
+
+    const char* gt_str = (g->mode == MODE_DE) ? "sd" : (g->mode == MODE_CS) ? "re" : (g->mode == MODE_AS) ? "as" : "dm";
+    if (g->imp && g->imp->cvar_set) {
+        g->imp->cvar_set(g->eng, "g_gametype", gt_str);
+    }
 
     g->score_t = 0;
     g->score_ct = 0;
@@ -1486,8 +1496,6 @@ static void cs16_init(hxServerGame* self, hxSGEngine* eng, hxSGImports* imp,
 
     query_map_spawns(g);
     query_objectives_from_bsp(g);
-
-    const char* gt_str = (g->mode == MODE_DE) ? "sd" : (g->mode == MODE_CS) ? "re" : "tdm";
     zbot_init(&g->zbot, g->eng, g->imp, g, cs16_bot_client_cmd, g->map_name, gt_str, "counterterrorist", "terrorist");
     g->zbot.attacking_team = 1;
 
@@ -1857,6 +1865,9 @@ static void cs16_client_spawn(hxServerGame* self, int client) {
     Cs16SGame* g = (Cs16SGame*)self;
     if (client < 0 || client >= MAX_CLIENTS) return;
     g->clients[client].active = 1;
+    if (client == 0 && g->clients[0].team <= 0) {
+        g->clients[0].team = 1;
+    }
     spawn_client_on_team(g, client);
     apply_player_model(g, client);
 }

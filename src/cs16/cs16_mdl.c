@@ -440,6 +440,22 @@ int cs16_mdl_to_obj_ex(const unsigned char* mdl_data, size_t mdl_size, unsigned 
     cs16_strbuf_printf(&sb, "# Wavefront OBJ converted from StudioMDL v10\n");
 
     if (!is_viewmodel && !is_p_model && numbones > 0) {
+        int rhand = -1;
+        for (int i = 0; i < numbones; ++i) {
+            if (strstr(bone_clean_names[i], "R Hand") != NULL ||
+                strstr(bone_clean_names[i], "R_Hand") != NULL ||
+                strstr(bone_clean_names[i], "r_hand") != NULL) {
+                rhand = i;
+                break;
+            }
+        }
+        if (rhand >= 0) {
+            cs16_strbuf_printf(&sb, "tag tag_weapon %.6f %.6f %.6f 0.000000 %.6f %.6f %.6f 0.000000 %.6f %.6f %.6f 0.000000 %.4f %.4f %.4f 1.000000\n",
+                bonetransforms[rhand][0][0], bonetransforms[rhand][1][0], bonetransforms[rhand][2][0],
+                bonetransforms[rhand][0][1], bonetransforms[rhand][1][1], bonetransforms[rhand][2][1],
+                bonetransforms[rhand][0][2], bonetransforms[rhand][1][2], bonetransforms[rhand][2][2],
+                bonetransforms[rhand][0][3], bonetransforms[rhand][1][3], bonetransforms[rhand][2][3] + 37.0f);
+        }
         for (int i = 0; i < numbones; ++i) {
             cs16_strbuf_printf(&sb, "bone \"%s\" %d %.6f %.6f %.6f %.6f %.4f %.4f %.4f\n",
                 bone_clean_names[i], bone_parent[i],
